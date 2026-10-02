@@ -429,21 +429,33 @@ func TestRollbackToChainStaleManager(t *testing.T) {
 	assert.Equal(t, forkHeight-1, w.Manager.SyncedTo().Height)
 }
 
-// TestDisconnectBlockNotChainSynced pins the current behavior of the live
-// disconnect path, which this change only instruments.
+// TestDisconnectBlockNotChainSynced ensures a disconnect that arrives before
+// the wallet is chain synced still rolls the block back, so its orphaned
+// coinbase does not stay in the balance.
 func TestDisconnectBlockNotChainSynced(t *testing.T) {
 	w, cleanup := testWallet(t)
 	defer cleanup()
 
 	orphan := mineCoinbase(t, w, orphanedBranch, forkHeight)
-	syncManagerTo(t, w, orphanedBranch, forkHeight, forkHeight)
+	syncManagerTo(t, w, orphanedBranch, forkHeight-1, forkHeight)
 	w.SetChainSynced(false)
+	w.chainClient = &reorgChainClient{
+		mockChainClient: &mockChainClient{
+			getBestBlockHeight: tipHeight,
+			getBlockHeader:     &wire.BlockHeader{Timestamp: branchTime(forkHeight - 1)},
+		},
+		blockHashes: map[int64]chainhash.Hash{
+			int64(forkHeight): branchHash(canonicalBranch, forkHeight),
+		},
+	}
 
 	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		return w.disconnectBlock(tx, blockMeta(orphanedBranch, forkHeight))
 	})
 	require.NoError(t, err)
 
-	assert.True(t, hasStoredCredit(t, w, orphan))
-	assert.Equal(t, forkHeight, w.Manager.SyncedTo().Height)
+	assert.False(t, hasStoredCredit(t, w, orphan))
+	assert.Nil(t, txDetails(t, w, orphan.Hash))
+	assert.Equal(t, forkHeight-1, w.Manager.SyncedTo().Height)
+	assert.Equal(t, branchHash(sharedBranch, forkHeight-1), w.Manager.SyncedTo().Hash)
 }
