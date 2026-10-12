@@ -107,6 +107,7 @@ pub use crate::v4::circuit::circuit_utils::{Fp8Verifier, Fp8VerifierCache};
 use crate::v4::circuit::ctl::NUM_TABLES;
 use crate::v4::circuit::driver::{FP8_REACHABLE_DEGREE_BITS, Fp8PublicData, Fp8System, Fp8Witness};
 use crate::v4::circuit::input_quant_stark::stark::InputQuantProgram;
+use crate::v4::circuit::matmul_b200_stark::columns::GROUP_WIDTH as MATMUL_GROUP_WIDTH;
 use crate::v4::circuit::scale_stark::stark::ScaleProgram;
 use crate::v4::circuit::unpredictability::budget;
 #[cfg(test)]
@@ -457,7 +458,7 @@ impl Fp8Job {
     /// Derives the statement of `params` (MoE or dense) from the proposed header. Fails
     /// (rather than panics) on any job outside the fp8 envelope.
     pub fn derive(params: &PublicParams, proposed_header: &IncompleteBlockHeader) -> Result<Self> {
-        params.recheck_moe()?;
+        params.recheck_admission()?;
         let (compiled, _, _) = params.compile(proposed_header)?;
         let (h, w, k, r) = (compiled.h, compiled.w, compiled.k, compiled.r);
 
@@ -629,8 +630,15 @@ impl Fp8Job {
         // expressions read.
         let iq = self.input_quant();
         let input_quant = iq.public_inputs::<F>().to_vec();
+        // Matmul schedule public inputs: [k/32, w, h*w, h*k].
+        let matmul = vec![
+            F::from_canonical_usize(iq.k / MATMUL_GROUP_WIDTH),
+            F::from_canonical_usize(iq.w),
+            F::from_canonical_usize(iq.h * iq.w),
+            F::from_canonical_usize(iq.h * iq.k),
+        ];
         let xor_fold = vec![F::from_canonical_u64(budget(iq.k, iq.h, iq.w))];
-        [blake3, input_quant, scale, vec![], xor_fold]
+        [blake3, input_quant, scale, matmul, xor_fold]
     }
 }
 

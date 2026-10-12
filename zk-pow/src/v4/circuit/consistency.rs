@@ -604,9 +604,9 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
             for r in &rows {
                 let v: &MatmulColumnsView<F> = r.borrow();
                 if v.is_cell_final == F::ONE && v.is_padding == F::ZERO {
-                    cell_words[to_u64(v.cell_id) as usize] =
-                        (to_u64(v.cell_result_f32_lo) | (to_u64(v.cell_result_f32_hi) << 16)) as u32;
-                    cell_skips[to_u64(v.cell_id) as usize] = to_u64(v.cell_skips);
+                    let cell = to_u64(v.out_row) as usize * w + to_u64(v.out_col) as usize;
+                    cell_words[cell] = (to_u64(v.cell_result_f32_lo) | (to_u64(v.cell_result_f32_hi) << 16)) as u32;
+                    cell_skips[cell] = to_u64(v.cell_skips);
                 }
             }
             (MatmulRows::H100(rows), pis.to_vec())
@@ -617,9 +617,9 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
             for r in &rows {
                 let v: &MatmulB200ColumnsView<F> = r.borrow();
                 if v.is_cell_final == F::ONE && v.is_padding == F::ZERO {
-                    cell_words[to_u64(v.cell_id) as usize] =
-                        (to_u64(v.cell_result_f32_lo) | (to_u64(v.cell_result_f32_hi) << 16)) as u32;
-                    cell_skips[to_u64(v.cell_id) as usize] = to_u64(v.cell_skips);
+                    let cell = to_u64(v.out_row) as usize * w + to_u64(v.out_col) as usize;
+                    cell_words[cell] = (to_u64(v.cell_result_f32_lo) | (to_u64(v.cell_result_f32_hi) << 16)) as u32;
+                    cell_skips[cell] = to_u64(v.cell_skips);
                 }
             }
             (MatmulRows::B200(rows), pis.to_vec())
@@ -1017,8 +1017,7 @@ fn wire_layer_rejects_k_not_multiple_of_32() {
     );
 }
 
-/// The ZK pipeline refuses to trace a job whose consolidated skip census exceeds the exact
-/// global budget. The plain verifier rejects the same fixture.
+/// The ZK pipeline rejects a job whose consolidated skip census exceeds its budget.
 #[test]
 #[should_panic(expected = "skippable summands exceed the census budget")]
 fn a_census_rejected_job_has_no_zk_trace() {

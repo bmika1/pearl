@@ -76,6 +76,8 @@
 //! the CTL slots matching `h`, `w`, `k`) is the gateway's job: it pins every slot to
 //! its own recomputation from the statement, rejecting any other assignment.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result, anyhow, ensure};
 use hashbrown::HashMap;
 use plonky2::field::extension::FieldExtension;
@@ -94,7 +96,7 @@ use plonky2::plonk::proof::{CompactProofWithPublicInputs, ProofWithPublicInputs,
 use plonky2::timed;
 use plonky2::util::serialization::{Buffer, Read, Write};
 use plonky2::util::timing::TimingTree;
-use plonky2_maybe_rayon::{MaybeIntoParIter, ParallelIterator};
+use plonky2_maybe_rayon::{MaybeParIter, ParallelIterator};
 use starky::batch_proof::BatchStarkProofWithPublicInputs;
 use starky::batch_recursive_verifier::BatchKnownColumnsTarget;
 use starky::batch_universal::{
@@ -431,25 +433,35 @@ pub fn expected_wrapper_public_inputs(
     expected.extend(system.degree_bits().iter().map(|&bits| F::from_canonical_usize(bits)));
     expected.extend(statement_digest_to_hash_out::<F>(statement_digest).elements);
     expected.extend(zeta.0);
-    // The class (a) recompute: evaluate the statement's own known columns at the proof's
-    // zeta and g_t * zeta — the same binding `batch_verify` performs natively. Each
-    // table's evaluation is independent (and already rayon-parallel inside), so the
-    // tables themselves run as parallel jobs; the assembly order below is unchanged.
+    // Evaluate known columns at zeta and g_t*zeta, as in native batch verification.
+    // Equal-height tables share g_t and barycentric setup, so evaluate them together
+    // and restore canonical table order below.
     type TableEvals = (
         Vec<QuadraticExtension<GoldilocksField>>,
         Vec<QuadraticExtension<GoldilocksField>>,
     );
-    let per_table: Vec<TableEvals> = (0..NUM_ALL_TABLES)
-        .into_par_iter()
-        .map(|t| {
-            if known.columns_per_table[t].is_empty() {
-                (vec![], vec![])
-            } else {
-                let columns: Vec<&PolynomialValues<F>> = known.values_per_table[t].iter().collect();
-                eval_columns_at_zeta_and_next::<F, D>(&columns, zeta, system.degree_bits()[t])
-            }
+    let mut by_height: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for t in 0..NUM_ALL_TABLES {
+        if !known.columns_per_table[t].is_empty() {
+            by_height.entry(system.degree_bits()[t]).or_default().push(t);
+        }
+    }
+    let groups: Vec<(usize, Vec<usize>)> = by_height.into_iter().collect();
+    let evaluated: Vec<TableEvals> = groups
+        .par_iter()
+        .map(|(bits, tables)| {
+            let columns: Vec<&PolynomialValues<F>> = tables.iter().flat_map(|&t| known.values_per_table[t].iter()).collect();
+            eval_columns_at_zeta_and_next::<F, D>(&columns, zeta, *bits)
         })
         .collect();
+    let mut per_table: Vec<TableEvals> = (0..NUM_ALL_TABLES).map(|_| (vec![], vec![])).collect();
+    for ((_, tables), (mut at_zeta, mut at_g_zeta)) in groups.iter().zip(evaluated) {
+        // Split from the back to preserve each table's column order.
+        for &t in tables.iter().rev() {
+            let split = at_zeta.len() - known.values_per_table[t].len();
+            per_table[t] = (at_zeta.split_off(split), at_g_zeta.split_off(split));
+        }
+    }
     let mut evals_at_zeta = Vec::new();
     let mut evals_at_g_zeta = Vec::new();
     for (at_zeta, at_g_zeta) in per_table {
