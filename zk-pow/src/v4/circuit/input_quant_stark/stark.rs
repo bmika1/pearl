@@ -376,6 +376,8 @@ impl InputQuantProgram {
     /// Both sides' packed public-seed noise codes, padded with zeros. The batch verifier
     /// checks their trace openings; group G constrains the decodes and schedule.
     pub fn known_values<F: RichField>(&self, a_noise: &[u16], b_noise: &[u16]) -> Vec<PolynomialValues<F>> {
+        use plonky2_maybe_rayon::*;
+
         let (h, w, num_rows) = (self.h, self.w, self.num_rows());
         assert_eq!(a_noise.len(), h * self.k, "a_noise must be h*k codes");
         assert_eq!(b_noise.len(), w * self.k, "b_noise must be w*k codes");
@@ -383,9 +385,15 @@ impl InputQuantProgram {
         let cols: Vec<PolynomialValues<F>> = [a_noise, b_noise]
             .into_iter()
             .map(|codes| {
-                let mut col = Vec::with_capacity(num_rows);
-                col.extend(codes.iter().map(|&c| F::from_canonical_u16(c)));
-                col.resize(num_rows, F::ZERO);
+                let mut col = vec![F::ZERO; num_rows];
+                col[..codes.len()]
+                    .par_chunks_mut(1024)
+                    .zip(codes.par_chunks(1024))
+                    .for_each(|(outs, codes)| {
+                        for (out, &code) in outs.iter_mut().zip(codes) {
+                            *out = F::from_canonical_u16(code);
+                        }
+                    });
                 PolynomialValues::new(col)
             })
             .collect();

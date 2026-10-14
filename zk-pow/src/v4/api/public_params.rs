@@ -610,8 +610,9 @@ impl PublicParams {
     /// products, compilation bytes, and generated known-column entries each count once.
     /// This weighting is admission policy, not a conversion from bytes to MACs or time.
     /// Fixed recursive verification is geometry-independent; plain proofs share this rule.
-    /// See `docs/decisions/002-v4-verifier-work-accounting.md` for the derivation and coverage.
-    pub(crate) const MAX_VERIFIER_WORK: u64 = 1 << 27;
+    /// Cap at 2T, where T = 121,922,274 is the score of the dense reference tile
+    /// h = w = 16, k = 2^16, r = 32, with four Blake lanes per axis (either device).
+    pub(crate) const MAX_VERIFIER_WORK: u64 = 2 * 121_922_274;
 
     /// Byte length of a dense (non-MoE) statement:
     /// σ_d (108) + pB (21) + HB (32) + pA (11) + HA (32) + tile bases (8) + J (32).
@@ -2196,7 +2197,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_work_budget_is_enforced_at_construction_parsing_and_recheck() {
+    fn aggregate_work_budget_admits_larger_profiles_at_construction_parsing_and_recheck() {
         for device in [Device::B200, Device::H100] {
             let mut params = dense_params();
             params.job.common.device = device;
@@ -2204,20 +2205,14 @@ mod tests {
             let blocks = params.blake3_work_block_bound().unwrap();
             assert!(params.verifier_work_units(blocks).unwrap() <= PublicParams::MAX_VERIFIER_WORK);
 
-            // Ordinary geometry can fit every component cap yet exceed the combined
-            // budget. Reject using only scalar counts, before deriving any work.
+            // This geometry exceeded the 2^27 budget and is admitted under 2T.
             params.job.common.k = 40960;
             let blocks = params.blake3_work_block_bound().unwrap();
             assert!(blocks <= (PublicParams::MAX_BLAKE3_WORK_BYTES / blake3::BLOCK_LEN) as u64);
-            assert!(params.verifier_work_units(blocks).unwrap() > PublicParams::MAX_VERIFIER_WORK);
-            let errors = [
-                PublicParams::try_new(params.job.clone(), params.jackpot_statement.clone(), None).unwrap_err(),
-                PublicParams::from_bytes(&params.to_bytes()).unwrap_err(),
-                params.recheck_admission().unwrap_err(),
-            ];
-            for error in errors {
-                assert!(error.to_string().contains("FP8 verifier work exceeds budget"), "{error}");
-            }
+            assert!(params.verifier_work_units(blocks).unwrap() <= PublicParams::MAX_VERIFIER_WORK);
+            PublicParams::try_new(params.job.clone(), params.jackpot_statement.clone(), None).unwrap();
+            PublicParams::from_bytes(&params.to_bytes()).unwrap();
+            params.recheck_admission().unwrap();
         }
     }
 
@@ -2267,7 +2262,7 @@ mod tests {
     }
 
     #[test]
-    fn arithmetic_budget_keeps_reference_and_bounds_larger_tiles() {
+    fn arithmetic_budget_is_twice_reference_work() {
         use super::test_fixtures::dense_geometry_job;
         for device in Device::ALL {
             let reference = PublicParams::try_new(dense_geometry_job(16, 16, 65536, device), empty_jackpot(), None).unwrap();
@@ -2276,12 +2271,10 @@ mod tests {
                 .unwrap();
             assert_eq!(reference_work, 121_922_274);
             assert!(reference_work <= PublicParams::MAX_VERIFIER_WORK);
-            assert!(PublicParams::MAX_VERIFIER_WORK < 2 * reference_work);
-            for (h, w, k) in [(4, 64, 30784), (4, 128, 16256), (32, 64, 22112)] {
+            assert_eq!(PublicParams::MAX_VERIFIER_WORK, 2 * reference_work);
+            for (h, w, k) in [(4, 64, 30784), (4, 128, 16256), (32, 64, 22112), (32, 64, 22144)] {
                 PublicParams::try_new(dense_geometry_job(h, w, k, device), empty_jackpot(), None).unwrap();
             }
-            let over = PublicParams::try_new(dense_geometry_job(32, 64, 22144, device), empty_jackpot(), None).unwrap_err();
-            assert!(over.to_string().contains("FP8 verifier work exceeds budget"));
         }
     }
 
@@ -2293,8 +2286,8 @@ mod tests {
     #[ignore = "manual admission-policy comparison"]
     fn report_verifier_work_coverage() {
         use super::test_fixtures::dense_geometry_job;
-        let budgets = [1 << 25, 1 << 26, 96 << 20, 1 << 27];
-        let mut accepted = [0u64; 4];
+        let budgets = [1 << 25, 1 << 26, 96 << 20, 1 << 27, PublicParams::MAX_VERIFIER_WORK];
+        let mut accepted = [0u64; 5];
         let mut previous = 0u64;
         let mut total = 0u64;
         for h in (4..=128u32).step_by(4) {

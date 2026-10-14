@@ -105,7 +105,8 @@ use starky::batch_universal::{
 };
 use starky::verifier::eval_columns_at_zeta_and_next;
 
-use super::ctl::{NUM_ALL_TABLES, NUM_TABLES};
+use super::blake3_stark::columns::{BLAKE3_COL_MAP, NUM_BLAKE3_KNOWN_COLUMNS};
+use super::ctl::{NUM_ALL_TABLES, NUM_TABLES, Table};
 use super::driver::{FP8_REACHABLE_DEGREE_BITS, Fp8System, fp8_universal_envelope, statement_digest_to_hash_out};
 use crate::v4::api::primitives::Hash256;
 use crate::v4::circuit::circuit_utils::build_recursion_config;
@@ -156,11 +157,12 @@ fn num_wrapper_public_inputs(system: &Fp8System<F, D>) -> usize {
 /// Splits the wrapper's flat public-input prefix back into per-table STARK public inputs
 /// (batch positions). Purely syntactic; [`verify_wrapped_proof`] is the judge of the values.
 pub fn split_batch_public_inputs(system: &Fp8System<F, D>, flat: &[F]) -> Result<Vec<Vec<F>>> {
+    let total = num_wrapper_public_inputs(system);
     ensure!(
-        flat.len() == num_wrapper_public_inputs(system),
+        flat.len() == total,
         "wrapped proof: wrong public input count (got {}, statement expects {})",
         flat.len(),
-        num_wrapper_public_inputs(system)
+        total
     );
     let mut offset = 0;
     Ok(system
@@ -391,25 +393,31 @@ pub fn verify_wrapped_proof(
     expected_public_inputs: &[Vec<F>; NUM_TABLES],
     statement_digest: Hash256,
 ) -> Result<()> {
+    let start = std::time::Instant::now();
     ensure!(
         verifier_data.common.config.zero_knowledge,
         "the wrapped verifier circuit must be the ZK stage"
     );
     system.ensure_statement_digest_binding(statement_digest)?;
-    let total = num_wrapper_public_inputs(system);
+    let total = verifier_data.common.num_public_inputs;
     ensure!(
         proof.public_inputs.len() == total,
-        "wrapped proof: wrong public input count (got {}, statement expects {})",
+        "wrapped proof: wrong public input count (got {}, circuit expects {})",
         proof.public_inputs.len(),
         total
     );
     let z = zeta_offset(system);
-    let zeta = QuadraticExtension([proof.public_inputs[z], proof.public_inputs[z + 1]]);
+    let limbs = proof
+        .public_inputs
+        .get(z..z + D)
+        .ok_or_else(|| anyhow!("wrapped proof: missing zeta in public inputs"))?;
+    let zeta = QuadraticExtension([limbs[0], limbs[1]]);
     let expected = expected_wrapper_public_inputs(system, expected_public_inputs, statement_digest, zeta)?;
     ensure!(
         proof.public_inputs == expected,
         "wrapped proof: public inputs do not match the statement's expectations"
     );
+    println!("preverif: {} ms", start.elapsed().as_millis());
     verifier_data.verify(proof.clone())
 }
 
@@ -440,6 +448,20 @@ pub fn expected_wrapper_public_inputs(
         Vec<QuadraticExtension<GoldilocksField>>,
         Vec<QuadraticExtension<GoldilocksField>>,
     );
+    // Dense programs have no routing or offsets instructions, so Blake3's final
+    // three known columns are identically zero. Their opening slots remain present.
+    const {
+        assert!(BLAKE3_COL_MAP.word_pin_first == BLAKE3_COL_MAP.moe_outer_indices_packed + 1);
+        assert!(BLAKE3_COL_MAP.word_pin_second == BLAKE3_COL_MAP.moe_outer_indices_packed + 2);
+        assert!(NUM_BLAKE3_KNOWN_COLUMNS == BLAKE3_COL_MAP.moe_outer_indices_packed + 3);
+    }
+    let evaluated_column_counts: [usize; NUM_ALL_TABLES] = core::array::from_fn(|t| {
+        if t == Table::Blake3 as usize && !system.has_moe() {
+            BLAKE3_COL_MAP.moe_outer_indices_packed // Index of the last nonzero known column, plus one for the count.
+        } else {
+            known.values_per_table[t].len()
+        }
+    });
     let mut by_height: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for t in 0..NUM_ALL_TABLES {
         if !known.columns_per_table[t].is_empty() {
@@ -450,7 +472,10 @@ pub fn expected_wrapper_public_inputs(
     let evaluated: Vec<TableEvals> = groups
         .par_iter()
         .map(|(bits, tables)| {
-            let columns: Vec<&PolynomialValues<F>> = tables.iter().flat_map(|&t| known.values_per_table[t].iter()).collect();
+            let columns: Vec<&PolynomialValues<F>> = tables
+                .iter()
+                .flat_map(|&t| known.values_per_table[t][..evaluated_column_counts[t]].iter())
+                .collect();
             eval_columns_at_zeta_and_next::<F, D>(&columns, zeta, *bits)
         })
         .collect();
@@ -458,8 +483,14 @@ pub fn expected_wrapper_public_inputs(
     for ((_, tables), (mut at_zeta, mut at_g_zeta)) in groups.iter().zip(evaluated) {
         // Split from the back to preserve each table's column order.
         for &t in tables.iter().rev() {
-            let split = at_zeta.len() - known.values_per_table[t].len();
+            let split = at_zeta.len() - evaluated_column_counts[t];
             per_table[t] = (at_zeta.split_off(split), at_g_zeta.split_off(split));
+            per_table[t]
+                .0
+                .resize(known.values_per_table[t].len(), QuadraticExtension::ZERO);
+            per_table[t]
+                .1
+                .resize(known.values_per_table[t].len(), QuadraticExtension::ZERO);
         }
     }
     let mut evals_at_zeta = Vec::new();
@@ -574,4 +605,41 @@ pub fn verify_compact_wrapped_proof(
         .context(
             "compact fp8 proof does not verify against the expected statement (mismatched header/statement or an invalid proof)",
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v4::api::public_params::Device;
+    use crate::v4::api::zk::Fp8Job;
+    use crate::v4::circuit::consistency::{fixture_job, fixture_job_asym, fixture_job_moe};
+
+    #[test]
+    fn known_openings_match_full_column_evaluation() {
+        let zeta = QuadraticExtension([F::from_canonical_u64(17), F::ONE]);
+        for fixture in [fixture_job, fixture_job_asym, fixture_job_moe] {
+            for device in [Device::B200, Device::H100] {
+                let (header, mut plain) = fixture();
+                plain.job.common.device = device;
+                let (_, params) = plain.parse_proof(&header).unwrap();
+                let job = Fp8Job::derive(&params, &header).unwrap();
+                let system = &job.system;
+                let pis = core::array::from_fn(|t| vec![F::ZERO; system.batch_starks()[t].num_public_inputs()]);
+                let expected = expected_wrapper_public_inputs(system, &pis, params.digest(&header), zeta).unwrap();
+                let (mut at_zeta, mut at_next) = (Vec::new(), Vec::new());
+                for t in 0..NUM_ALL_TABLES {
+                    let columns = system.known().values_per_table[t].iter().collect::<Vec<_>>();
+                    let (local, next) = eval_columns_at_zeta_and_next::<F, D>(&columns, zeta, system.degree_bits()[t]);
+                    at_zeta.extend(local);
+                    at_next.extend(next);
+                }
+                let full = at_zeta
+                    .into_iter()
+                    .chain(at_next)
+                    .flat_map(|value| value.0)
+                    .collect::<Vec<_>>();
+                assert_eq!(&expected[zeta_offset(system) + D..expected.len() - 1], full);
+            }
+        }
+    }
 }

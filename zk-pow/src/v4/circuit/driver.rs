@@ -249,7 +249,7 @@ pub struct Fp8PublicData {
 }
 
 /// Verifier-recomputable leading columns for the five main tables. This is only an
-/// intermediate representation: [`Fp8System::derive_known_columns`] is the sole place
+/// intermediate representation: [`Fp8System::assemble_known_columns`] is the sole place
 /// that converts it to the positional layout the batch verifier requires.
 struct MainTableKnownValues<F: RichField> {
     blake3: Vec<PolynomialValues<F>>,
@@ -329,13 +329,6 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulBackend<F, D> {
             Self::H100(stark) => stark.num_rows(),
             Self::B200(stark) => stark.num_rows(),
         }
-    }
-
-    /// Class (a) known columns: none — Matmul's schedule is carried in witness
-    /// columns pinned in-AIR. Kept alongside the other tables' generators so a
-    /// future known column changes only this method.
-    fn known_values(&self) -> Vec<PolynomialValues<F>> {
-        Vec::new()
     }
 
     /// Generates the Matmul trace from InputQuant-bound operand data.
@@ -437,23 +430,43 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
     /// Derives the five main tables' verifier-known columns from a statement. This is
     /// the only cross-table owner of their canonical batch order and metadata.
     pub(super) fn derive_known_columns(data: &Fp8PublicData) -> BatchKnownColumns<F> {
+        let ((blake3, input_quant), (scale, xor_fold)) = plonky2_maybe_rayon::join(
+            || {
+                plonky2_maybe_rayon::join(
+                    || {
+                        data.blake3.known_values::<F>(&Blake3KnownInputs {
+                            a_values_len: data.a_values_len,
+                            a_scales_len: data.a_scales_len,
+                            b_values_len: data.b_values_len,
+                            b_scales_len: data.b_scales_len,
+                        })
+                    },
+                    || data.input_quant.known_values::<F>(&data.a_noise, &data.b_noise),
+                )
+            },
+            || plonky2_maybe_rayon::join(|| data.scale.known_values::<F>(), || data.xor_fold.known_values::<F>()),
+        );
+        Self::assemble_known_columns(data, blake3, input_quant, scale, xor_fold)
+    }
+
+    fn assemble_known_columns(
+        data: &Fp8PublicData,
+        blake3: Vec<PolynomialValues<F>>,
+        input_quant: Vec<PolynomialValues<F>>,
+        scale: Vec<PolynomialValues<F>>,
+        xor_fold: Vec<PolynomialValues<F>>,
+    ) -> BatchKnownColumns<F> {
         debug_assert_eq!(
             data.input_quant.device, data.scale.device,
             "InputQuant and Scale must use the same committed device"
         );
         let device = data.scale.device;
-        let matmul = MatmulBackend::<F, D>::new(device, data.input_quant.h, data.input_quant.w, data.input_quant.k);
         MainTableKnownValues {
-            blake3: data.blake3.known_values::<F>(&Blake3KnownInputs {
-                a_values_len: data.a_values_len,
-                a_scales_len: data.a_scales_len,
-                b_values_len: data.b_values_len,
-                b_scales_len: data.b_scales_len,
-            }),
-            input_quant: data.input_quant.known_values::<F>(&data.a_noise, &data.b_noise),
-            scale: data.scale.known_values::<F>(),
-            matmul: matmul.known_values(),
-            xor_fold: data.xor_fold.known_values::<F>(),
+            blake3,
+            input_quant,
+            scale,
+            matmul: Vec::new(),
+            xor_fold,
         }
         .into_batch_known_columns(device)
     }
@@ -463,6 +476,23 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
     /// the known-column data — all in the canonical table order.
     pub fn new(data: Fp8PublicData) -> Self {
         let known = Self::derive_known_columns(&data);
+        Self::with_known_columns(data, known)
+    }
+
+    /// Reuses columns generated alongside the programs; canonical layout and shape
+    /// checks remain owned by this driver.
+    pub(crate) fn new_with_known_values(
+        data: Fp8PublicData,
+        blake3: Vec<PolynomialValues<F>>,
+        input_quant: Vec<PolynomialValues<F>>,
+        scale: Vec<PolynomialValues<F>>,
+        xor_fold: Vec<PolynomialValues<F>>,
+    ) -> Self {
+        let known = Self::assemble_known_columns(&data, blake3, input_quant, scale, xor_fold);
+        Self::with_known_columns(data, known)
+    }
+
+    fn with_known_columns(data: Fp8PublicData, known: BatchKnownColumns<F>) -> Self {
         let Fp8PublicData {
             blake3,
             input_quant,
@@ -607,6 +637,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
     /// recompute). The digest slot is empty until `bind_statement_digest` fills it.
     pub(super) fn known(&self) -> &BatchKnownColumns<F> {
         &self.known
+    }
+
+    pub(super) fn has_moe(&self) -> bool {
+        self.blake3.program.moe.is_some()
     }
 
     /// Binds `statement_digest` into the known-column Fiat-Shamir slot. The caller of
@@ -1135,8 +1169,8 @@ mod tests {
     fn admission_work_covers_derived_known_layout() {
         use crate::v4::api::prequant::BLOCK_SIZE;
         use crate::v4::api::primitives::IncompleteBlockHeader;
-        use crate::v4::api::public_params::HashId;
         use crate::v4::api::public_params::test_fixtures::{dense_params, empty_jackpot};
+        use crate::v4::api::public_params::{HashId, known_column_evaluation_products};
         use crate::v4::api::zk::Fp8Job;
         use crate::v4::circuit::blake3_stark::stark::ROWS_PER_COMPRESSION;
 
@@ -1162,10 +1196,8 @@ mod tests {
                     (h * w * (k / 32)).next_power_of_two(),
                     (h * w).next_power_of_two(),
                 ];
-                let mut work = 25_000_000
-                    + 4 * (h + w) * k * r
-                    + 24 * r * (h + w + 2 * k)
-                    + 2 * ((h + w) * k + 2 * (h + w) * (k / BLOCK_SIZE as u64) + blocks * blake3::BLOCK_LEN as u64);
+                let compiled_bytes = (h + w) * k + 2 * (h + w) * (k / BLOCK_SIZE as u64) + blocks * blake3::BLOCK_LEN as u64;
+                let mut work = (h + w) * k * r + 2 * r * (h + w + 2 * k) + compiled_bytes;
                 for table in Table::ALL {
                     let index = table as usize;
                     let actual_height = 1u64 << system.degree_bits()[index];
@@ -1180,7 +1212,7 @@ mod tests {
                     assert!(values.iter().all(|column| column.len() as u64 == actual_height));
                     if !values.is_empty() {
                         let columns = values.len() as u64;
-                        work += heights[index] * (4 * columns + 4 * (2 * columns + 1));
+                        work += heights[index] * columns + known_column_evaluation_products(heights[index], columns).unwrap();
                     }
                 }
                 assert_eq!(params.verifier_work_units(blocks).unwrap(), work);
