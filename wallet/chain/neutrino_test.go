@@ -1,6 +1,7 @@
 package chain
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	neutrino "github.com/pearl-research-labs/pearl/spv"
 	"github.com/pearl-research-labs/pearl/spv/headerfs"
 	"github.com/pearl-research-labs/pearl/spv/pushtx"
 	"github.com/stretchr/testify/assert"
@@ -336,4 +338,64 @@ func TestNeutrinoClientBlockStampTracksChainService(t *testing.T) {
 	nc.WaitForShutdown()
 	_, err = nc.BlockStamp()
 	require.ErrorContains(t, err, "disconnected")
+}
+
+type failingRescanner struct {
+	errChan chan error
+	done    bool
+}
+
+func (f *failingRescanner) Start() <-chan error {
+	return f.errChan
+}
+
+func (f *failingRescanner) Update(...neutrino.UpdateOption) error {
+	if f.done {
+		return errors.New("Rescan is already done and cannot be updated.")
+	}
+	return nil
+}
+
+func (f *failingRescanner) WaitForShutdown() {}
+
+func TestNeutrinoClientNotifyReceivedRestartsAfterRescanExit(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu         sync.Mutex
+		rescanners []*failingRescanner
+	)
+	nc := &NeutrinoClient{
+		CS: &mockChainService{},
+		newRescan: func(...neutrino.RescanOption) rescanner {
+			mu.Lock()
+			defer mu.Unlock()
+			r := &failingRescanner{errChan: make(chan error, 1)}
+			rescanners = append(rescanners, r)
+			return r
+		},
+	}
+
+	require.NoError(t, nc.Start(t.Context()))
+	defer func() {
+		nc.Stop()
+		nc.WaitForShutdown()
+	}()
+
+	require.NoError(t, nc.NotifyReceived(nil))
+	require.Len(t, rescanners, 1)
+
+	rescanners[0].done = true
+	rescanners[0].errChan <- errors.New("peer disconnected")
+
+	require.Eventually(t, func() bool {
+		nc.clientMtx.Lock()
+		defer nc.clientMtx.Unlock()
+		return !nc.scanning
+	}, maxDur, 10*time.Millisecond)
+
+	require.NoError(t, nc.NotifyReceived(nil))
+	mu.Lock()
+	assert.Len(t, rescanners, 2)
+	mu.Unlock()
 }
