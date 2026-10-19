@@ -753,9 +753,10 @@ mod tests {
             "cleared trace-final flag undetected"
         );
         let known = stark.program.known_values::<F>();
+        let tampered_row = stark.program.skip_limit as usize - 1;
         assert_ne!(
-            known[XOR_FOLD_COL_MAP.is_lane_final].values[rows.len() - 1],
-            forged[rows.len() - 1][XOR_FOLD_COL_MAP.is_lane_final],
+            known[XOR_FOLD_COL_MAP.is_lane_final].values[tampered_row],
+            forged[tampered_row][XOR_FOLD_COL_MAP.is_lane_final],
             "IS_LANE_FINAL must diverge from the verifier's recompute"
         );
     }
