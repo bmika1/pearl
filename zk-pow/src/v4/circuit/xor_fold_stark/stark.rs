@@ -97,10 +97,10 @@ impl XorFoldProgram {
         self.lanes.iter().map(Vec::len).sum()
     }
 
-    /// Trace height: the live rows padded to the next power of two with all-zero
+    /// Trace height: the live rows padded up to the consensus FRI ladder with all-zero
     /// `IS_PAD = 1` rows.
     pub fn num_rows(&self) -> usize {
-        self.live_rows().next_power_of_two()
+        crate::v4::circuit::driver::ladder_padded_rows(self.live_rows())
     }
 
     /// `cell_words[c]` is cell `c`'s f32 bit pattern and `cell_skips[c]` is its certified
@@ -447,9 +447,9 @@ mod tests {
         };
         let words: Vec<u32> = (0..48u32).map(|i| f32::to_bits(i as f32 - 20.5)).collect();
         let (rows, pis) = program.generate_trace::<F>(&words, &vec![1; words.len()]);
-        assert_eq!(rows.len(), 64, "48 live rows pad to 64");
+        assert_eq!(rows.len(), 128, "48 live rows pad to the 2^7 ladder stop");
         let known = program.known_values::<F>();
-        assert!(known.iter().all(|c| c.len() == 64));
+        assert!(known.iter().all(|c| c.len() == 128));
         // The known columns are bit-exact with the trace fill (the batch verifier's check).
         for (c, col) in known.iter().enumerate() {
             for (r, row) in rows.iter().enumerate() {

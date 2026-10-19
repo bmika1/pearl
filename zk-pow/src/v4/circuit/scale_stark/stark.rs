@@ -337,10 +337,10 @@ impl ScaleProgram {
         self.h + self.w
     }
 
-    /// Trace height: the live rows padded to the next power of two with all-zero-tuple
-    /// `IS_PAD = 1` rows (excluded from the group-tuple CTL).
+    /// Trace height: the live rows padded up to the consensus FRI ladder with
+    /// all-zero-tuple `IS_PAD = 1` rows (excluded from the group-tuple CTL).
     pub fn num_rows(&self) -> usize {
-        self.live_rows().next_power_of_two()
+        crate::v4::circuit::driver::ladder_padded_rows(self.live_rows())
     }
 
     /// `dr = bf16(DELTA * sqrt(r))` — mirrors the private `quantization::delta_r_bf16`

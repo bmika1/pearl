@@ -227,9 +227,10 @@ impl InputQuantProgram {
     }
 
     /// Trace height: one row per element pair, grouped into matrix rows of `k` consecutive
-    /// trace rows and padded to the next power of two with both-sides-dead phantom rows.
+    /// trace rows and padded up to the consensus FRI ladder with both-sides-dead phantom
+    /// rows ([`ladder_padded_rows`]).
     pub fn num_rows(&self) -> usize {
-        self.live_rows().next_power_of_two()
+        crate::v4::circuit::driver::ladder_padded_rows(self.live_rows())
     }
 
     /// `Wl2 = 27 - ceil(log2 k)`: the job's block-L2 frame width ([`l2_frame_width`].
@@ -2424,7 +2425,8 @@ mod tests {
             &inp.b_scales,
             &inp.b_noise,
         );
-        assert_eq!(rows.len(), 512, "next_power_of_two(5 * 96)");
+        // 5*96 = 480 live rows: natural 2^9, padded up to the 2^10 ladder stop.
+        assert_eq!(rows.len(), 1024, "ladder_padded_rows(5 * 96)");
         let stark = S::new(program.clone());
         assert!(constraints_vanish(&stark, &rows, &pis), "padded trace violates a constraint");
 
