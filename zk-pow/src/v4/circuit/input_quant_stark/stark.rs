@@ -2443,7 +2443,8 @@ mod tests {
         assert_eq!(rows[288][m.a_live], F::ZERO);
         assert_eq!(rows[479][m.b_live], F::ONE);
         assert_eq!(rows[480][m.b_live], F::ZERO);
-        assert_eq!(rows[511][m.is_group_final], F::ONE, "the truncated tail must close");
+        // The truncated tail group now spans the phantom fill to the trace's last row.
+        assert_eq!(rows[1023][m.is_group_final], F::ONE, "the truncated tail must close");
 
         // Every declared LUT instance stays in its table's domain on the padded trace (the
         // phantom fill's derived fields and keys must be as legal as live ones — unfiltered
@@ -2495,7 +2496,9 @@ mod tests {
             f64::from(bf16_to_f32(x_code).abs()) >= 8.0 * program.device.delta() * f64::from(bf16_to_f32(l2f(opened, g)))
         };
 
-        for (r, row) in rows.iter().enumerate() {
+        // The bit-exact recompute covers live rows only; phantom rows beyond
+        // `max(h, w) * k` carry zeroed sides with no native counterpart.
+        for (r, row) in rows.iter().enumerate().take(h.max(program.w) * k) {
             let v: &InputQuantColumnsView<F> = row.borrow();
             let g = r / k;
             for (side, opened, noise) in [(&side_a(v), &opened_a, &inp.a_noise), (&side_b(v), &opened_b, &inp.b_noise)] {

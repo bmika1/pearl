@@ -743,7 +743,10 @@ mod tests {
         // one engineered so FOLD_OUT(last) = 0, is caught by the batch verifier's
         // known-column recompute.)
         let mut forged = rows.clone();
-        let last: &mut XorFoldColumnsView<F> = forged.last_mut().unwrap().borrow_mut();
+        // The trace-final flag lives on the last *live* row (`skip_limit`); the ladder
+        // pad rows beyond it are all-zero phantom rows with no final flag to clear.
+        let last = &mut forged[stark.program.skip_limit as usize - 1];
+        let last: &mut XorFoldColumnsView<F> = last.borrow_mut();
         last.is_lane_final = F::ZERO;
         assert!(
             constraints_violated(&stark, &forged, &pis),
