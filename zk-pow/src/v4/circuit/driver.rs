@@ -1013,7 +1013,7 @@ mod tests {
         // (on-ladder maxima only: an off-ladder max adds its own boundary and diverges).
         let deep = schedule_boundaries(&[22, 7]);
         for max in [21, 20, 19, 18, 16, 13] {
-            let shallow = schedule_boundaries(&[max, 5]);
+            let shallow = schedule_boundaries(&[max, 7]);
             let offset = deep.iter().position(|&b| b == max).unwrap();
             assert_eq!(
                 shallow.as_slice(),
@@ -1143,8 +1143,11 @@ mod tests {
         // Each table's *padded* reach (the ladder stops its live height can pad onto) must
         // equal its envelope range, and the union must cover every ladder stop.
         let up = |bits: usize| -> usize {
+            // The ladder is sorted descending: the smallest fitting stop is the last
+            // one `>= bits`, matching `ladder_padded_rows`' tail-first scan.
             FP8_REACHABLE_DEGREE_BITS
                 .iter()
+                .rev()
                 .find(|&&stop| stop >= bits)
                 .copied()
                 .expect("live reach above the ladder's tallest stop")
