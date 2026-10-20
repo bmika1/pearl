@@ -775,6 +775,23 @@ impl<F: Field> GrandProductChallenge<F> {
         reduce_with_powers(terms, FE::from_basefield(self.beta)) + FE::from_basefield(self.gamma)
     }
 
+    /// Like [`Self::combine`], but takes an iterator of owned values, so tuples can be
+    /// evaluated and compressed on demand without materializing them.
+    pub fn combine_owned<FE, P, T: IntoIterator<Item = P>, const D2: usize>(&self, terms: T) -> P
+    where
+        FE: FieldExtension<D2, BaseField = F>,
+        P: PackedField<Scalar = FE>,
+        T::IntoIter: DoubleEndedIterator,
+    {
+        let beta = FE::from_basefield(self.beta);
+        let gamma = FE::from_basefield(self.gamma);
+        terms
+            .into_iter()
+            .rev()
+            .fold(P::ZEROS, |acc, term| acc * beta + term)
+            + gamma
+    }
+
     /// Like `combine`, but takes an iterator of owned values instead of references.
     pub fn combine_base<T: IntoIterator<Item = F>>(&self, terms: T) -> F
     where
@@ -1015,9 +1032,13 @@ fn constrain_helper_columns<P: PackedField>(
 }
 
 /// Given data associated to a lookup, check the associated helper polynomials.
+///
+/// Each column tuple is evaluated and challenge-combined on demand (each tuple is
+/// consumed exactly once per chunk of the helper-column walk), so no per-point
+/// `Vec` of tuple evaluations is materialized.
 pub(crate) fn eval_helper_columns<F, FE, P, const D: usize, const D2: usize>(
     filter: &[Filter<F>],
-    columns: &[Vec<P>],
+    columns: &[&[Column<F>]],
     local_values: &[P],
     next_values: &[P],
     public_inputs: &[FE],
@@ -1035,7 +1056,13 @@ pub(crate) fn eval_helper_columns<F, FE, P, const D: usize, const D2: usize>(
     }
     constrain_helper_columns(
         columns.len(),
-        |i| challenges.combine(&columns[i]),
+        |i| {
+            challenges.combine_owned(
+                columns[i]
+                    .iter()
+                    .map(|c| c.eval_with_next(local_values, next_values, public_inputs)),
+            )
+        },
         |i| filter[i].eval_filter(local_values, next_values, public_inputs),
         helper_columns,
         constraint_degree,

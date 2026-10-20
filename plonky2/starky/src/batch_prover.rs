@@ -883,17 +883,6 @@ where
 
     let z_h_on_coset = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits);
 
-    // Retrieves the LDE values of `n` of the table's polynomials from a role
-    // oracle at index `i_start`, addressing the table's degree index and
-    // leaf offset within the (possibly shared) oracle.
-    let get_values_packed =
-        |(oracle, degree_index, leaf_offset): (&BatchFriOracle<F, C, D>, usize, usize),
-         n: usize,
-         i_start: usize|
-         -> Vec<P> {
-            oracle.get_lde_values_packed(degree_index, i_start, step, leaf_offset, n)
-        };
-
     let num_columns = layout.num_columns[t];
     let num_lookup_columns = layout.num_lookup_columns[t];
     let num_ctl_columns = ctl_data
@@ -903,32 +892,33 @@ where
     let num_aux = layout.num_aux_polys(t);
 
     // Assembles the full trace row (online and preprocessed columns interleaved
-    // back in their original positions) at index `i_start`.
-    let get_trace_values_packed = |i_start: usize| -> Vec<P> {
-        let online = get_values_packed(trace_oracle, layout.online_columns[t].len(), i_start);
-        let mut row = vec![P::ZEROS; num_columns];
-        for (k, &c) in layout.online_columns[t].iter().enumerate() {
-            row[c] = online[k];
-        }
-        if !layout.prep_columns[t].is_empty() {
-            // The shared preprocessed oracle is multi-height: address the
-            // table's columns through its degree index and leaf offset.
-            let (degree_index, leaf_offset) = layout.prep_leaf_position(t);
-            let prep = prep_oracle
-                .expect("Preprocessed columns without a preprocessed oracle")
-                .get_lde_values_packed(
-                    degree_index,
-                    i_start,
-                    step,
-                    leaf_offset,
-                    layout.prep_columns[t].len(),
-                );
-            for (k, &c) in layout.prep_columns[t].iter().enumerate() {
-                row[c] = prep[k];
+    // back in their original positions) at index `i_start` into `row`, using the
+    // scratch buffers for the raw oracle fetches (no steady-state allocation).
+    let get_trace_values_packed_into =
+        |i_start: usize, row: &mut [P], online: &mut [P], prep: &mut [P]| {
+            let (oracle, degree_index, leaf_offset) = trace_oracle;
+            oracle.get_lde_values_packed_into(degree_index, i_start, step, leaf_offset, online);
+            for (k, &c) in layout.online_columns[t].iter().enumerate() {
+                row[c] = online[k];
             }
-        }
-        row
-    };
+            if !layout.prep_columns[t].is_empty() {
+                // The shared preprocessed oracle is multi-height: address the
+                // table's columns through its degree index and leaf offset.
+                let (prep_degree_index, prep_leaf_offset) = layout.prep_leaf_position(t);
+                prep_oracle
+                    .expect("Preprocessed columns without a preprocessed oracle")
+                    .get_lde_values_packed_into(
+                        prep_degree_index,
+                        i_start,
+                        step,
+                        prep_leaf_offset,
+                        prep,
+                    );
+                for (k, &c) in layout.prep_columns[t].iter().enumerate() {
+                    row[c] = prep[k];
+                }
+            }
+        };
 
     // Last element of the subgroup.
     let last = F::primitive_root_of_unity(degree_bits).inverse();
@@ -939,12 +929,72 @@ where
         size,
     );
 
+    // ---- Per-point constants, prepared once before the parallel loop ----
+    // The CTL metadata (challenges, column references, filters) is identical at
+    // every evaluation point; only the helper-column values and the Z
+    // evaluations vary. Each rayon job takes one cloned template
+    // (`map_init`) and refills only those point-dependent fields per batch.
+    let ctl_meta: Option<Vec<CtlCheckVars<F, F, P, 1>>> = ctl_data.map(|data| {
+        let mut vars = Vec::with_capacity(data.zs_columns.len());
+        for (i, zs_columns) in data.zs_columns.iter().enumerate() {
+            let num_ctl_helper_cols = num_ctl_columns[i];
+            vars.push(CtlCheckVars::<F, F, P, 1> {
+                helper_columns: vec![P::ZEROS; num_ctl_helper_cols],
+                local_z: P::ZEROS,
+                next_z: P::ZEROS,
+                challenges: zs_columns.challenge,
+                columns: zs_columns.columns.clone(),
+                filter: zs_columns.filter.clone(),
+            });
+        }
+        vars
+    });
+    // The helper-column `(start, len)` and Z-evaluation indices of each
+    // `CtlZData` within the auxiliary rows — point-independent layout.
+    let ctl_layout: Option<(Vec<(usize, usize)>, Vec<usize>)> = ctl_data.map(|data| {
+        let mut helper_ranges = Vec::with_capacity(data.zs_columns.len());
+        let mut z_indices = Vec::with_capacity(data.zs_columns.len());
+        let mut start_index = 0;
+        for (i, _zs_columns) in data.zs_columns.iter().enumerate() {
+            let num_ctl_helper_cols = num_ctl_columns[i];
+            helper_ranges.push((num_lookup_columns + start_index, num_ctl_helper_cols));
+            z_indices.push(num_lookup_columns + total_num_helper_cols + i);
+            start_index += num_ctl_helper_cols;
+        }
+        (helper_ranges, z_indices)
+    });
+
+    // Per-worker quotient-loop state: the CTL template (metadata cloned once
+    // per job, not per point), the lookup challenges copy, and the reusable
+    // row buffers (trace rows and auxiliary rows, refilled per point).
+    let ctl_meta_template = ctl_meta.clone();
+    let lookup_challenges_copy = lookup_challenges.cloned();
+    let make_scratch = || {
+        (
+            ctl_meta_template.clone(),
+            lookup_challenges_copy.clone(),
+            // Trace row buffers: local/next full rows plus the raw online and
+            // preprocessed fetch buffers.
+            (
+                vec![P::ZEROS; num_columns],
+                vec![P::ZEROS; num_columns],
+                vec![P::ZEROS; layout.online_columns[t].len()],
+                vec![P::ZEROS; layout.prep_columns[t].len()],
+            ),
+            // Auxiliary row buffers: local/next.
+            (vec![P::ZEROS; num_aux], vec![P::ZEROS; num_aux]),
+        )
+    };
+
     // We will step by `P::WIDTH`, and in each iteration, evaluate the quotient polynomial at
     // a batch of `P::WIDTH` points.
     let quotient_values = (0..size)
         .into_par_iter()
         .step_by(P::WIDTH)
-        .flat_map_iter(|i_start| {
+        // Coarse jobs bound how often `map_init` clones the per-job CTL
+        // template (and keep the rayon scheduling overhead negligible).
+        .with_min_len(1024)
+        .map_init(make_scratch, |scratch, i_start| {
             let i_next_start = (i_start + next_step) % size;
             let i_range = i_start..i_start + P::WIDTH;
 
@@ -960,19 +1010,57 @@ where
                 lagrange_basis_last,
             );
 
-            let local_values = get_trace_values_packed(i_start);
-            let next_values = get_trace_values_packed(i_next_start);
+            // Fetch the trace rows into the reusable buffers (no per-point
+            // allocation).
+            let ((local_buf, next_buf, online_buf, prep_buf), _) = (&mut scratch.2, &mut scratch.3);
+            get_trace_values_packed_into(i_start, local_buf, online_buf, prep_buf);
+            get_trace_values_packed_into(i_next_start, next_buf, online_buf, prep_buf);
+            let local_values: &mut [P] = local_buf;
+            let next_values: &mut [P] = next_buf;
 
-            let (aux_local, aux_next) = if num_aux > 0 {
-                let aux_oracle = aux_oracle.expect("Auxiliary polys without an auxiliary oracle");
-                (
-                    get_values_packed(aux_oracle, num_aux, i_start),
-                    get_values_packed(aux_oracle, num_aux, i_next_start),
-                )
+            // Fetch the auxiliary rows into their reusable buffers.
+            let (aux_local, aux_next): (&mut [P], &mut [P]) = if num_aux > 0 {
+                let (aux_oracle, degree_index, leaf_offset) =
+                    aux_oracle.expect("Auxiliary polys without an auxiliary oracle");
+                aux_oracle.get_lde_values_packed_into(
+                    degree_index,
+                    i_start,
+                    step,
+                    leaf_offset,
+                    &mut (scratch.3).0,
+                );
+                aux_oracle.get_lde_values_packed_into(
+                    degree_index,
+                    i_next_start,
+                    step,
+                    leaf_offset,
+                    &mut (scratch.3).1,
+                );
+                (&mut (scratch.3).0, &mut (scratch.3).1)
             } else {
-                (vec![], vec![])
+                (&mut [], &mut [])
             };
 
+            // Refill the worker-local CTL template's point-dependent fields
+            // (helper-column values and the Z evaluations).
+            let ctl_vars: Option<&[CtlCheckVars<F, F, P, 1>]> =
+                scratch.0.as_mut().zip(ctl_layout.as_ref()).and_then(
+                    |(vars, (helper_ranges, z_indices))| {
+                        if vars.is_empty() {
+                            return None;
+                        }
+                        for (z_vars, &(start, len)) in vars.iter_mut().zip(helper_ranges.iter()) {
+                            z_vars
+                                .helper_columns
+                                .copy_from_slice(&aux_local[start..start + len]);
+                        }
+                        for (i, z_vars) in vars.iter_mut().enumerate() {
+                            z_vars.local_z = aux_local[z_indices[i]];
+                            z_vars.next_z = aux_next[z_indices[i]];
+                        }
+                        Some(&vars[..])
+                    },
+                );
             let lookup_vars = lookup_challenges.map(|challenges| {
                 LookupCheckVars::new(
                     aux_local[..num_lookup_columns].to_vec(),
@@ -981,39 +1069,15 @@ where
                 )
             });
 
-            let ctl_vars = ctl_data.map(|data| {
-                let mut start_index = 0;
-                data.zs_columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, zs_columns)| {
-                        let num_ctl_helper_cols = num_ctl_columns[i];
-                        let helper_columns = aux_local[num_lookup_columns + start_index
-                            ..num_lookup_columns + start_index + num_ctl_helper_cols]
-                            .to_vec();
-                        let ctl_vars = CtlCheckVars::<F, F, P, 1> {
-                            helper_columns,
-                            local_z: aux_local[num_lookup_columns + total_num_helper_cols + i],
-                            next_z: aux_next[num_lookup_columns + total_num_helper_cols + i],
-                            challenges: zs_columns.challenge,
-                            columns: zs_columns.columns.clone(),
-                            filter: zs_columns.filter.clone(),
-                        };
-                        start_index += num_ctl_helper_cols;
-                        ctl_vars
-                    })
-                    .collect::<Vec<_>>()
-            });
-
             // Evaluate the polynomial combining all constraints, including
             // those associated to the lookup and CTL arguments.
             stark.eval_vanishing_poly_packed(
-                &local_values,
-                &next_values,
+                local_values,
+                next_values,
                 public_inputs,
                 lookups,
                 lookup_vars,
-                ctl_vars.as_deref(),
+                ctl_vars,
                 &mut consumer,
             );
 
@@ -1025,12 +1089,15 @@ where
             }
 
             let num_challenges = alphas.len();
-            (0..P::WIDTH).map(move |i| {
-                (0..num_challenges)
-                    .map(|j| constraints_evals[j].as_slice()[i])
-                    .collect()
-            })
+            (0..P::WIDTH)
+                .map(move |i| {
+                    (0..num_challenges)
+                        .map(|j| constraints_evals[j].as_slice()[i])
+                        .collect()
+                })
+                .collect::<Vec<_>>()
         })
+        .flat_map_iter(|rows| rows)
         .collect::<Vec<_>>();
 
     Ok(Some(

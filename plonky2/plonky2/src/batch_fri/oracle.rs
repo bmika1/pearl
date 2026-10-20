@@ -362,6 +362,46 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             })
             .collect_vec()
     }
+
+    /// [`Self::get_lde_values_packed`] into a caller-provided buffer, so
+    /// quotient-loop row fetches can reuse allocations across evaluation
+    /// points. `buf` must have exactly the desired slice length; the packed
+    /// value of column `j` lands in `buf[j]`.
+    pub fn get_lde_values_packed_into<P>(
+        &self,
+        degree_bits_index: usize,
+        index_start: usize,
+        step: usize,
+        slice_start: usize,
+        buf: &mut [P],
+    ) where
+        P: PackedField<Scalar = F>,
+    {
+        let slice_len = buf.len();
+        // The `P::WIDTH` point rows, fetched once and transposed column-wise
+        // into the buffer (mirrors `get_lde_values_packed` without the
+        // per-call allocation).
+        let rows: Vec<&[F]> = (0..P::WIDTH)
+            .map(|w| {
+                self.get_lde_values(
+                    degree_bits_index,
+                    index_start + w,
+                    step,
+                    slice_start,
+                    slice_len,
+                )
+            })
+            .collect();
+        for (j, slot) in buf.iter_mut().enumerate() {
+            let mut packed = P::ZEROS;
+            packed
+                .as_slice_mut()
+                .iter_mut()
+                .zip(rows.iter())
+                .for_each(|(packed_w, row_w)| *packed_w = row_w[j]);
+            *slot = packed;
+        }
+    }
 }
 
 #[cfg(test)]
