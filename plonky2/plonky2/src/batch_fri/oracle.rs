@@ -171,19 +171,27 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         None,
                     )
                 );
-                let mut rows = transpose(&lde);
-                reverse_index_bits_in_place(&mut rows);
+                let mut rows = timed!(timing, "transpose LDEs", transpose(&lde));
+                timed!(
+                    timing,
+                    "bit-reverse leaf rows",
+                    reverse_index_bits_in_place(&mut rows)
+                );
                 rows
             })
             .collect();
-        let leaves = row_values
-            .iter()
-            .map(|rows| {
-                rows.par_iter()
-                    .map(|row| C::Hasher::hash_no_pad(row).to_vec())
-                    .collect()
-            })
-            .collect();
+        let leaves = timed!(
+            timing,
+            "hash digest leaves",
+            row_values
+                .iter()
+                .map(|rows| {
+                    rows.par_iter()
+                        .map(|row| C::Hasher::hash_no_pad(row).to_vec())
+                        .collect()
+                })
+                .collect()
+        );
         let batch_merkle_tree = timed!(
             timing,
             "build digest Merkle tree",

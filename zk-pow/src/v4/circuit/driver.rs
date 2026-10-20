@@ -68,6 +68,7 @@ use plonky2::hash::merkle_tree::MerkleCap;
 use plonky2::plonk::config::GenericConfig;
 use plonky2::util::log2_strict;
 use plonky2::util::timing::TimingTree;
+use plonky2::timed;
 use primitive_types::U256;
 use starky::batch_proof::BatchStarkProofWithPublicInputs;
 use starky::batch_prover::{BatchStarkPreprocessedData, BatchStarkPreprocessedVerifierData, batch_prove};
@@ -725,13 +726,17 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         let le_codes = |bytes: &[u8]| -> Vec<u16> { bytes.chunks(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect() };
         let (a_int8, b_int8) = (as_int8(witness.a_values), as_int8(witness.b_values));
         let (a_scale_codes, b_scale_codes) = (le_codes(witness.a_scales), le_codes(witness.b_scales));
-        let (iq_rows, iq_pis) = self.input_quant.program.generate_trace::<F>(
+        let (iq_rows, iq_pis) = timed!(
+            timing,
+            "trace: input_quant",
+            self.input_quant.program.generate_trace::<F>(
             &a_int8,
             &a_scale_codes,
             &self.a_noise,
             &b_int8,
             &b_scale_codes,
             &self.b_noise,
+            )
         );
 
         // ---- Scale: one aggregate tuple per matrix row, exactly what InputQuant committed. ----
@@ -762,7 +767,11 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
                 })
                 .collect()
         };
-        let (scale_rows, scale_pis) = self.scale.program.generate_trace::<F>(&tuples(false), &tuples(true));
+        let (scale_rows, scale_pis) = timed!(
+            timing,
+            "trace: scale",
+            self.scale.program.generate_trace::<F>(&tuples(false), &tuples(true))
+        );
 
         // ---- Matmul: the noised fp8 codes and summand scores InputQuant committed (same
         // element order). Live rows only: past a side's
@@ -787,12 +796,19 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
                 })
                 .collect()
         };
-        let (mat_trace, mat_pis, cell_words, cell_skips) =
+        let (mat_trace, mat_pis, cell_words, cell_skips) = timed!(
+            timing,
+            "trace: matmul",
             self.matmul
-                .generate_trace(&codes(false), &codes(true), &lambdas(false), &lambdas(true));
+                .generate_trace(&codes(false), &codes(true), &lambdas(false), &lambdas(true))
+        );
 
         // ---- XorFold: fold Matmul's finished cell words into the lottery lanes. ----
-        let (xf_rows, xf_pis) = self.xor_fold.program.generate_trace::<F>(&cell_words, &cell_skips);
+        let (xf_rows, xf_pis) = timed!(
+            timing,
+            "trace: xor_fold",
+            self.xor_fold.program.generate_trace::<F>(&cell_words, &cell_skips)
+        );
 
         // ---- Blake3: the strip bytes and the folded lottery words under the job schedule. ----
         let mut lottery_words = [0u32; 16];
@@ -805,7 +821,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
                     as u32;
             }
         }
-        let (b3_rows, b3_pis) = self.blake3.program.generate_trace::<F>(&Blake3TraceInputs {
+        let (b3_rows, b3_pis) = timed!(
+            timing,
+            "trace: blake3",
+            self.blake3.program.generate_trace::<F>(&Blake3TraceInputs {
             a_values: witness.a_values,
             a_scales: witness.a_scales,
             b_values: witness.b_values,
@@ -822,7 +841,8 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             b_hash_id: witness.b_hash_id,
             routing_hash_id: witness.routing_hash_id,
             offsets_hash_id: witness.offsets_hash_id,
-        });
+            })
+        );
 
         // The proof ships the public inputs the witness generates (keys, roots, the geometry
         // and dead-limit slots, the lottery digest); the verifier pins every slot to its own
