@@ -48,6 +48,7 @@ use plonky2::iop::ext_target::ExtensionTarget;
 use plonky2::iop::target::Target;
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::config::GenericConfig;
+use plonky2_maybe_rayon::*;
 
 use crate::config::StarkConfig;
 use crate::constraint_consumer::{ConstraintConsumer, RecursiveConstraintConsumer};
@@ -340,46 +341,48 @@ pub(crate) fn cross_table_lookup_data<'a, F: RichField, const D: usize, const N:
     ctl_challenges: &GrandProductChallengeSet<F>,
     constraint_degree: usize,
 ) -> [CtlData<'a, F>; N] {
-    let mut ctl_data_per_table = [0; N].map(|_| CtlData::default());
-    for CrossTableLookup {
-        looking_tables,
-        looked_tables,
-    } in cross_table_lookups
-    {
-        log::debug!("Processing CTL for {:?}", looked_tables[0].table);
-        for &challenge in &ctl_challenges.challenges {
-            // Both sides are processed identically: per trace, batch its instances into
-            // helper columns (when more than one) and one Z polynomial. The looking side
-            // comes first — `CtlCheckVars::from_openings` and
-            // `verify_cross_table_lookups` rely on this order.
-            for tables in [looking_tables, looked_tables] {
-                let helper_zs = ctl_helper_zs_cols(
-                    trace_poly_values,
-                    public_inputs,
-                    tables.clone(),
-                    challenge,
-                    constraint_degree,
-                );
+    // The unit of parallelizable work: one (table, side-instances) group of one side of
+    // one CTL under one challenge — exactly one `partial_sums` call. Its metadata
+    // (columns, filters, challenge) is constant across the whole domain, so the units
+    // are enumerated up front (in the exact serial order, which the verifier mirrors)
+    // and their helper columns and Z polynomials computed in parallel.
+    struct CtlWork<'a, F: Field> {
+        table: TableIdx,
+        columns_filters: Vec<ColumnFilter<'a, F>>,
+        challenge: GrandProductChallenge<F>,
+        columns: Vec<&'a [Column<F>]>,
+        filter: Vec<Filter<F>>,
+    }
 
-                for (table, helpers_zs) in helper_zs {
-                    let num_helpers = helpers_zs.len() - 1;
-                    let count = tables.iter().filter(|twc| twc.table == table).count();
-                    let cols_filts = tables.iter().filter_map(|twc| {
-                        if twc.table == table {
-                            Some((&twc.columns, &twc.filter))
-                        } else {
-                            None
-                        }
-                    });
-                    let mut columns = Vec::with_capacity(count);
-                    let mut filter = Vec::with_capacity(count);
-                    for (col, filt) in cols_filts {
-                        columns.push(&col[..]);
-                        filter.push(filt.clone());
-                    }
-                    ctl_data_per_table[table].zs_columns.push(CtlZData {
-                        helper_columns: helpers_zs[..num_helpers].to_vec(),
-                        z: helpers_zs[num_helpers].clone(),
+    let mut works: Vec<CtlWork<'a, F>> = Vec::new();
+    for ctl in cross_table_lookups {
+        let CrossTableLookup {
+            looking_tables,
+            looked_tables,
+        } = ctl;
+        log::debug!("Processing CTL for {:?}", looked_tables[0].table);
+        // Both sides are processed identically: per trace, batch its instances into
+        // helper columns (when more than one) and one Z polynomial. Per challenge, the
+        // looking side comes first — `CtlCheckVars::from_openings` and
+        // `verify_cross_table_lookups` rely on this order.
+        for &challenge in &ctl_challenges.challenges {
+            for tables in [looking_tables, looked_tables] {
+                // Group this side's instances by trace, mirroring `group_by(|twc| twc.table)`:
+                // each group shares helper columns and one Z polynomial.
+                for (table, group) in &tables.iter().group_by(|twc| twc.table) {
+                    let group: Vec<&TableWithColumns<F>> = group.collect();
+                    let columns_filters = group
+                        .iter()
+                        .map(|twc| (&twc.columns[..], &twc.filter))
+                        .collect::<Vec<_>>();
+                    let columns = group.iter().map(|twc| &twc.columns[..]).collect::<Vec<_>>();
+                    let filter = group
+                        .iter()
+                        .map(|twc| twc.filter.clone())
+                        .collect::<Vec<_>>();
+                    works.push(CtlWork {
+                        table,
+                        columns_filters,
                         challenge,
                         columns,
                         filter,
@@ -388,38 +391,32 @@ pub(crate) fn cross_table_lookup_data<'a, F: RichField, const D: usize, const N:
             }
         }
     }
-    ctl_data_per_table
-}
 
-/// Computes helper columns and Z polynomials for all looking tables
-/// of one cross-table lookup (i.e. for one looked table).
-fn ctl_helper_zs_cols<F: Field, const N: usize>(
-    all_stark_traces: &[Vec<PolynomialValues<F>>; N],
-    public_inputs: &[Vec<F>; N],
-    looking_tables: Vec<TableWithColumns<F>>,
-    challenge: GrandProductChallenge<F>,
-    constraint_degree: usize,
-) -> Vec<(usize, Vec<PolynomialValues<F>>)> {
-    let grouped_lookups = looking_tables.iter().group_by(|a| a.table);
-
-    grouped_lookups
-        .into_iter()
-        .map(|(table, group)| {
-            let columns_filters = group
-                .map(|table| (&table.columns[..], &table.filter))
-                .collect::<Vec<(&[Column<F>], &Filter<F>)>>();
-            (
-                table,
-                partial_sums(
-                    &all_stark_traces[table],
-                    &public_inputs[table],
-                    &columns_filters,
-                    challenge,
-                    constraint_degree,
-                ),
+    let results: Vec<Vec<PolynomialValues<F>>> = works
+        .par_iter()
+        .map(|work| {
+            partial_sums(
+                &trace_poly_values[work.table],
+                &public_inputs[work.table],
+                &work.columns_filters,
+                work.challenge,
+                constraint_degree,
             )
         })
-        .collect::<Vec<(usize, Vec<PolynomialValues<F>>)>>()
+        .collect::<Vec<_>>();
+
+    let mut ctl_data_per_table = [0; N].map(|_| CtlData::default());
+    for (work, helpers_zs) in works.into_iter().zip(results) {
+        let num_helpers = helpers_zs.len() - 1;
+        ctl_data_per_table[work.table].zs_columns.push(CtlZData {
+            helper_columns: helpers_zs[..num_helpers].to_vec(),
+            z: helpers_zs[num_helpers].clone(),
+            challenge: work.challenge,
+            columns: work.columns,
+            filter: work.filter,
+        });
+    }
+    ctl_data_per_table
 }
 
 /// Computes the cross-table lookup partial sums for one table and given column linear combinations.
@@ -637,20 +634,20 @@ pub(crate) fn eval_cross_table_lookup_checks<F, FE, P, S, const D: usize, const 
             filter,
         } = lookup_vars;
 
-        // Compute all linear combinations on the current table, and combine them using the challenge.
-        let evals = columns
-            .iter()
-            .map(|col| {
-                col.iter()
-                    .map(|c| c.eval_with_next(local_values, next_values, public_inputs))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        // Challenge-combine a column tuple on demand; each tuple is consumed at most
+        // once below, so no per-point tuple-evaluation vector is materialized.
+        let combine_tuple = |i: usize| {
+            challenges.combine_owned(
+                columns[i]
+                    .iter()
+                    .map(|c| c.eval_with_next(local_values, next_values, public_inputs)),
+            )
+        };
 
         // Check helper columns.
         eval_helper_columns(
             filter,
-            &evals,
+            columns,
             local_values,
             next_values,
             public_inputs,
@@ -667,8 +664,8 @@ pub(crate) fn eval_cross_table_lookup_checks<F, FE, P, S, const D: usize, const 
             // Check `Z(w) = Z(gw) + \sum h_i`
             consumer.constraint_transition(*local_z - *next_z - h_sum);
         } else if columns.len() > 1 {
-            let combin0 = challenges.combine(&evals[0]);
-            let combin1 = challenges.combine(&evals[1]);
+            let combin0 = combine_tuple(0);
+            let combin1 = combine_tuple(1);
 
             let f0 = filter[0].eval_filter(local_values, next_values, public_inputs);
             let f1 = filter[1].eval_filter(local_values, next_values, public_inputs);
@@ -679,7 +676,7 @@ pub(crate) fn eval_cross_table_lookup_checks<F, FE, P, S, const D: usize, const 
                 combin0 * combin1 * (*local_z - *next_z) - f0 * combin1 - f1 * combin0,
             );
         } else {
-            let combin0 = challenges.combine(&evals[0]);
+            let combin0 = combine_tuple(0);
             let f0 = filter[0].eval_filter(local_values, next_values, public_inputs);
             consumer.constraint_last_row(combin0 * *local_z - f0);
             consumer.constraint_transition(combin0 * (*local_z - *next_z) - f0);
