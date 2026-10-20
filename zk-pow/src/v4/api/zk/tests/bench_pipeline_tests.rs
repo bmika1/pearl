@@ -213,7 +213,7 @@ fn bench_pipeline() {
 
     // ---- optional one-time warmup (the cold/warm A/B lever) ----
     if do_warmup {
-        let mut timing = TimingTree::new("warmup", log::Level::Info);
+        let timing = TimingTree::new("warmup", log::Level::Info);
         let t = Instant::now();
         prover.warmup_prove(device).expect("warmup prove of the sample job");
         println!("BENCH warmup_seconds={:.3}", t.elapsed().as_secs_f64());

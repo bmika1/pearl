@@ -82,7 +82,7 @@ impl TimingTree {
         assert!(self.is_open());
 
         // We don't want a scope's log level to be stronger than that of its parent.
-        level = level.max(self.level);
+        level = level.min(self.level);
 
         if let Some(last_child) = self.children.last_mut() {
             if last_child.is_open() {
