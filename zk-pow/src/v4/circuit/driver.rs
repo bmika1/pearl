@@ -579,6 +579,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         self.scale.program.device
     }
 
+    /// The Blake3 witness bounds of this statement's schedule — how many auxiliary
+    /// 64-byte messages and auxiliary sibling CVs an honest witness must supply
+    /// (the unopened subtrees of the operand forests). Prover-side sizing input.
+    pub fn blake3_aux_bounds(&self) -> (usize, usize) {
+        (self.blake3.program.num_aux_msgs, self.blake3.program.num_aux_cvs)
+    }
+
     #[cfg(test)]
     pub fn matmul_num_columns(&self) -> usize {
         self.matmul.as_stark().num_columns()
