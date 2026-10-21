@@ -270,9 +270,7 @@ impl<F: PrimeField64> LutChecker<F> {
                     for (table_position, src) in counts.counts.into_iter().enumerate() {
                         let table = counts.tables[table_position];
                         let dst_position = self.multiplicities.table_position(table);
-                        for (dst_slot, src_slot) in
-                            self.multiplicities.counts[dst_position].iter_mut().zip(src)
-                        {
+                        for (dst_slot, src_slot) in self.multiplicities.counts[dst_position].iter_mut().zip(src) {
                             for (dst_row, src_row) in dst_slot.iter_mut().zip(src_slot) {
                                 *dst_row += src_row;
                             }

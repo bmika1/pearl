@@ -492,10 +492,7 @@ fn partial_sums_with_evals<F: Field>(
     constraint_degree: usize,
 ) -> Vec<PolynomialValues<F>> {
     let degree = filters.first().map_or(0, |f| f.len());
-    debug_assert!(columns
-        .iter()
-        .flatten()
-        .all(|c| c.len() == degree));
+    debug_assert!(columns.iter().flatten().all(|c| c.len() == degree));
 
     let group = constraint_degree.checked_sub(1).unwrap_or(1);
     let mut z = Vec::with_capacity(degree);

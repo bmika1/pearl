@@ -1133,14 +1133,21 @@ where
     let zeta_next = zeta.scalar_mul(g);
 
     // Evaluates a range of an oracle's polynomials at `z`, shifted by the
-    // table's flat start within the oracle.
+    // table's flat start within the oracle. Horner over the extension
+    // accumulator with in-place base-coefficient lifts: no per-polynomial
+    // extension copy is materialized (the old `to_extension().eval(z)`
+    // allocated a full Vec<FE> per polynomial).
     let eval_polys = |(oracle, start): (&BatchFriOracle<F, C, D>, usize),
                       range: core::ops::Range<usize>,
                       z: F::Extension|
      -> Vec<F::Extension> {
         oracle.polynomials[start + range.start..start + range.end]
             .par_iter()
-            .map(|p| p.to_extension::<D>().eval(z))
+            .map(|p| {
+                p.coeffs.iter().rev().fold(F::Extension::ZERO, |acc, &c| {
+                    acc * z + F::Extension::from_basefield(c)
+                })
+            })
             .collect()
     };
 
