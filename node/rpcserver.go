@@ -1894,6 +1894,33 @@ func handleGetBlockTemplateLongPoll(s *rpcServer, longPollID string, useCoinbase
 	return result, nil
 }
 
+// staleTipTemplateAllowed reports whether getblocktemplate may run while the tip
+// is older than the 24-hour IsCurrent window.
+//
+// ReduceMinDifficulty networks are meant to resume after a gap. Refusing a
+// template there leaves the tip old forever, because nothing else can mine the
+// block that would make it current. Mainnet keeps the refusal: a node whose
+// peers are partitioned also looks caught up, and extending that tip would
+// cement the partition. A peer advertising a higher block still refuses.
+func staleTipTemplateAllowed(s *rpcServer, height int32) bool {
+	if !s.cfg.ChainParams.ReduceMinDifficulty {
+		return false
+	}
+	if cp := s.cfg.Chain.LatestCheckpoint(); cp != nil && height < cp.Height {
+		return false
+	}
+	peers := s.cfg.ConnMgr.ConnectedPeers()
+	if len(peers) == 0 {
+		return false
+	}
+	for _, p := range peers {
+		if p.ToPeer().LastBlock() > height {
+			return false
+		}
+	}
+	return true
+}
+
 // handleGetBlockTemplateRequest is a helper for handleGetBlockTemplate which
 // deals with generating and returning block templates to the caller.  It
 // handles both long poll requests as specified by BIP 0022 as well as regular
@@ -1948,7 +1975,7 @@ func handleGetBlockTemplateRequest(s *rpcServer, request *btcjson.TemplateReques
 
 	// No point in generating or accepting work before the chain is synced.
 	currentHeight := s.cfg.Chain.BestSnapshot().Height
-	if currentHeight != 0 && !s.cfg.Chain.IsCurrent() {
+	if currentHeight != 0 && !s.cfg.Chain.IsCurrent() && !staleTipTemplateAllowed(s, currentHeight) {
 		return nil, &btcjson.RPCError{
 			Code:    btcjson.ErrRPCClientInInitialDownload,
 			Message: "Pearl is downloading blocks...",
