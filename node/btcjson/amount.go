@@ -89,17 +89,18 @@ func (a *Amount) UnmarshalJSON(data []byte) error {
 	for zeros := exponent - minExponent; zeros > 0; zeros-- {
 		value *= 10
 	}
-	limit := uint64(math.MaxInt64)
-	if negative {
-		limit++
+	// MinInt64's magnitude cannot be represented as a positive int64.
+	if negative && value == uint64(math.MaxInt64)+1 {
+		*a = Amount(math.MinInt64)
+		return nil
 	}
-	if value > limit {
+	if value > uint64(math.MaxInt64) {
 		return fmt.Errorf("amount is outside the int64 grain range")
 	}
+	amount := Amount(value)
 	if negative {
-		*a = Amount(-int64(value-1) - 1)
-	} else {
-		*a = Amount(value)
+		amount = -amount
 	}
+	*a = amount
 	return nil
 }
