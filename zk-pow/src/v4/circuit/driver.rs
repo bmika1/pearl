@@ -66,9 +66,9 @@ use plonky2::fri::reduction_strategies::FriReductionStrategy;
 use plonky2::hash::hash_types::{HashOut, RichField};
 use plonky2::hash::merkle_tree::MerkleCap;
 use plonky2::plonk::config::GenericConfig;
+use plonky2::timed;
 use plonky2::util::log2_strict;
 use plonky2::util::timing::TimingTree;
-use plonky2::timed;
 use primitive_types::U256;
 use starky::batch_proof::BatchStarkProofWithPublicInputs;
 use starky::batch_prover::{BatchStarkPreprocessedData, BatchStarkPreprocessedVerifierData, batch_prove};
@@ -730,12 +730,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             timing,
             "trace: input_quant",
             self.input_quant.program.generate_trace::<F>(
-            &a_int8,
-            &a_scale_codes,
-            &self.a_noise,
-            &b_int8,
-            &b_scale_codes,
-            &self.b_noise,
+                &a_int8,
+                &a_scale_codes,
+                &self.a_noise,
+                &b_int8,
+                &b_scale_codes,
+                &self.b_noise,
             )
         );
 
@@ -825,22 +825,22 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             timing,
             "trace: blake3",
             self.blake3.program.generate_trace::<F>(&Blake3TraceInputs {
-            a_values: witness.a_values,
-            a_scales: witness.a_scales,
-            b_values: witness.b_values,
-            b_scales: witness.b_scales,
-            routing_words: witness.routing_words,
-            offsets_words: witness.offsets_words,
-            aux_msgs: witness.aux_msgs,
-            aux_cvs: witness.aux_cvs,
-            lottery_words,
-            key_a: witness.key_a,
-            key_b: witness.key_b,
-            jackpot_key: witness.jackpot_key,
-            a_hash_id: witness.a_hash_id,
-            b_hash_id: witness.b_hash_id,
-            routing_hash_id: witness.routing_hash_id,
-            offsets_hash_id: witness.offsets_hash_id,
+                a_values: witness.a_values,
+                a_scales: witness.a_scales,
+                b_values: witness.b_values,
+                b_scales: witness.b_scales,
+                routing_words: witness.routing_words,
+                offsets_words: witness.offsets_words,
+                aux_msgs: witness.aux_msgs,
+                aux_cvs: witness.aux_cvs,
+                lottery_words,
+                key_a: witness.key_a,
+                key_b: witness.key_b,
+                jackpot_key: witness.jackpot_key,
+                a_hash_id: witness.a_hash_id,
+                b_hash_id: witness.b_hash_id,
+                routing_hash_id: witness.routing_hash_id,
+                offsets_hash_id: witness.offsets_hash_id,
             })
         );
 
@@ -989,10 +989,33 @@ pub struct Fp8Witness<'a> {
 }
 
 /// Row-major trace rows -> the column-major `PolynomialValues` layout of the batch prover.
+///
+/// Parallel over blocks of 8 adjacent columns: every 64-byte source line serves exactly one
+/// block's job, so the whole matrix streams from DRAM once (the naive per-column pass reads
+/// it once per column). Column buffers are written through their `MaybeUninit` spare
+/// capacity — each `(column, row)` slot is written exactly once before the length is set.
 fn column_major<F: RichField, const N: usize>(rows: &[[F; N]]) -> Vec<PolynomialValues<F>> {
-    (0..N)
-        .map(|c| PolynomialValues::new(rows.iter().map(|r| r[c]).collect()))
-        .collect()
+    /// Columns per parallel job: 8 Goldilocks elements = one 64-byte line.
+    const COL_BLOCK: usize = 8;
+
+    let num_rows = rows.len();
+    let mut cols: Vec<Vec<F>> = (0..N).map(|_| Vec::with_capacity(num_rows)).collect();
+    {
+        use plonky2_maybe_rayon::{IndexedParallelIterator, MaybeParChunksMut, ParallelIterator};
+        cols.par_chunks_mut(COL_BLOCK).enumerate().for_each(|(b, block)| {
+            let c0 = b * COL_BLOCK;
+            let mut bufs: Vec<_> = block.iter_mut().map(|col| col.spare_capacity_mut()).collect();
+            for (i, row) in rows.iter().enumerate() {
+                for (j, buf) in bufs.iter_mut().enumerate() {
+                    buf[i].write(row[c0 + j]);
+                }
+            }
+            for col in block.iter_mut() {
+                unsafe { col.set_len(num_rows) };
+            }
+        });
+    }
+    cols.into_iter().map(PolynomialValues::new).collect()
 }
 
 #[cfg(test)]
@@ -1008,6 +1031,20 @@ mod tests {
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = GoldilocksField;
+
+    /// The blocked `column_major` must be value-identical to the naive per-column gather.
+    #[test]
+    fn column_major_matches_naive_gather() {
+        const N: usize = 13;
+        let rows: Vec<[F; N]> = (0..1024u32)
+            .map(|i| std::array::from_fn(|c| F::from_canonical_u32(i * 31 + c as u32 * 7 + (i * c as u32) % 5)))
+            .collect();
+        let blocked = column_major::<F, N>(&rows);
+        for c in 0..N {
+            let naive: Vec<F> = rows.iter().map(|r| r[c]).collect();
+            assert_eq!(blocked[c].values, naive, "column {c} diverged");
+        }
+    }
 
     /// Arbitrary 32-byte salt for driver tests that do not intercept `J`.
     const STATEMENT_DIGEST: Hash256 = [0x11; 32];

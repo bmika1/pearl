@@ -51,6 +51,7 @@ use plonky2::field::packed::PackedField;
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::ext_target::ExtensionTarget;
 use plonky2::plonk::circuit_builder::CircuitBuilder;
+use plonky2_maybe_rayon::{IndexedParallelIterator, ParallelIterator};
 use starky::constraint_consumer::{ConstraintConsumer, RecursiveConstraintConsumer};
 use starky::evaluation_frame::{StarkEvaluationFrame, StarkFrame};
 use starky::stark::Stark;
@@ -157,214 +158,264 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkH100<F, D> {
         let live_rows_per_cell = k / GROUP_WIDTH;
         let num_rows = self.num_rows();
 
-        let mut rows: Vec<[F; NUM_MATMUL_COLUMNS]> = Vec::with_capacity(num_rows);
-        for r in 0..h {
-            for c in 0..w {
-                // ---- The k/32 live group-steps (group-sum emulation columns). ----
-                let mut carry = OutTriple::ZERO;
-                let mut incoming_carry_is_zero = true;
-                let mut global = GlobalTriple::ZERO;
-                // Consolidated policy anchors, filled in after the cell replay.
-                let cell_start = rows.len();
-                let mut e_cell = 0u64;
-                let mut e_z_window = 0u64;
-                let mut e_z_windows = Vec::with_capacity(live_rows_per_cell.div_ceil(4));
-                for j in 0..live_rows_per_cell {
-                    let is_final = j == live_rows_per_cell - 1;
-                    let is_window_final = (j + 1).is_multiple_of(4) || is_final;
-                    let mut row = MatmulColumnsView {
-                        is_cell_final: F::from_bool(is_final),
-                        is_window_final: F::from_bool(is_window_final),
-                        incoming_carry_is_zero: F::from_bool(incoming_carry_is_zero),
-                        ..Default::default()
-                    };
-
-                    // Decode the 32 lanes and receive their summand scores.
-                    let mut lanes = [Fp8Product::ZERO; GROUP_WIDTH];
-                    for i in 0..GROUP_WIDTH {
-                        let operand_codes_a = a_codes[r * k + j * GROUP_WIDTH + i];
-                        let operand_codes_b = b_codes[c * k + j * GROUP_WIDTH + i];
-                        lanes[i] = Fp8Product::new(operand_codes_a, operand_codes_b);
-                        row.operand_codes_a[i] = F::from_canonical_u8(operand_codes_a);
-                        row.operand_codes_b[i] = F::from_canonical_u8(operand_codes_b);
-                        row.prod_fp22_exp[i] = F::from_canonical_u64(lanes[i].fp22_exp);
-                        row.lambda_a[i] = F::from_canonical_u64(a_lambdas[r * k + j * GROUP_WIDTH + i]);
-                        row.lambda_b[i] = F::from_canonical_u64(b_lambdas[c * k + j * GROUP_WIDTH + i]);
-                        // M13: the lane's binade, as served by PRODALIGN15.
-                        let lane_binade = lanes[i].biased_binade();
-                        row.lane_binades[i] = F::from_canonical_u64(lane_binade);
-                        e_cell = e_cell.max(lane_binade);
-                        if lane_binade != 0 {
-                            // Add 5 to convert e(product)+139 to Hopper's grid encoding e(product)-13+157.
-                            e_z_window = e_z_window.max(lane_binade + 5);
-                        }
-                    }
-
-                    // The group's max FP22 exponent over the nonzero terms (zero terms never set
-                    // the max, mirroring the simulator's -139 sentinel); the free witness on
-                    // all-zero rows is pinned to the products' sentinel — the honest max of a
-                    // row of sentinels — so every PRODALIGN15 key stays in-domain (shift 0) and
-                    // the attainment chain vanishes through the sentinel factors.
-                    let mut group_max_product_exponent: Option<u64> = (!incoming_carry_is_zero).then_some(carry.exp);
-                    for lane in &lanes {
-                        if !lane.is_zero {
-                            group_max_product_exponent =
-                                Some(group_max_product_exponent.map_or(lane.fp22_exp, |m| m.max(lane.fp22_exp)));
-                        }
-                    }
-                    let group_max_product_exponent = group_max_product_exponent.unwrap_or(FP22_ZERO_SENTINEL);
-                    row.group_max_product_exponent = F::from_canonical_u64(group_max_product_exponent);
-                    // The M3 attainment chain: running products of the affine lane factors
-                    // F_i = GROUP_MAX_PRODUCT_EXPONENT - PROD_FP22_EXP_i (three into the first link, two per link
-                    // after, the last one alone) — the definitional fill of the link equalities.
-                    let factor = |i: usize| F::from_canonical_u64(group_max_product_exponent) - row.prod_fp22_exp[i];
-                    row.max_exponent_attainment[0] = factor(0) * factor(1) * factor(2);
-                    for j in 1..NUM_ATT_LINKS - 1 {
-                        row.max_exponent_attainment[j] =
-                            row.max_exponent_attainment[j - 1] * factor(2 * j + 1) * factor(2 * j + 2);
-                    }
-                    row.max_exponent_attainment[NUM_ATT_LINKS - 1] =
-                        row.max_exponent_attainment[NUM_ATT_LINKS - 2] * factor(GROUP_WIDTH - 1);
-
-                    // Align the 33 terms to the max exponent and sum exactly, as `_group_sum`:
-                    // products at the 15-bit frame `sig_a*sig_b*2^7 = (sig << 17) >> 10`, the
-                    // carry at its 14-bit significand, both floor-shifted towards zero.
-                    let mut total: i64 = 0;
-                    for i in 0..GROUP_WIDTH {
-                        if lanes[i].is_zero {
-                            continue; // ALIGNED_LANE_TERMS stays 0 (the table's zero-pair rows hold 0).
-                        }
-                        let shift = group_max_product_exponent - lanes[i].fp22_exp; // >= 0: max dominates.
-                        let mag = ((lanes[i].sig << 7) >> shift.min(63)) as i64;
-                        row.aligned_lane_terms[i] = if lanes[i].sign {
-                            -F::from_canonical_u64(mag as u64)
-                        } else {
-                            F::from_canonical_u64(mag as u64)
-                        };
-                        total += if lanes[i].sign { -mag } else { mag };
-                    }
-                    if incoming_carry_is_zero {
-                        // Canonical witness on the inactive carry path.
-                        row.incoming_carry_shift_power = F::ONE;
-                    } else {
-                        let shift = (group_max_product_exponent - carry.exp).min(CARRY_SHIFT_CAP); // POW2G's min-cap.
-                        let shift_pow2 = 1u64 << shift;
-                        let aligned = carry.sig14 >> shift;
-                        let remainder = carry.sig14 - aligned * shift_pow2;
-                        row.incoming_carry_shift_power = F::from_canonical_u64(shift_pow2);
-                        row.aligned_incoming_carry = F::from_canonical_u64(aligned);
-                        row.incoming_carry_remainder = F::from_canonical_u64(remainder);
-                        total += if carry.sign { -(aligned as i64) } else { aligned as i64 };
-                    }
-
-                    // Sum, renormalize (WIDTHNORM semantics), and emit through the output mux.
-                    row.group_sum_sign = F::from_bool(total < 0);
-                    row.group_sum_abs = F::from_canonical_u64(total.unsigned_abs());
-                    row.group_sum_is_zero = F::from_bool(total == 0);
-                    debug_assert!(total.unsigned_abs() < 1 << 20, "frame sums fit 20 bits");
-                    let out = if total == 0 {
-                        OutTriple::ZERO // The +0 path (Z = GROUP_SUM_IS_ZERO; all-zero rows sum to 0).
-                    } else {
-                        let mag = total.unsigned_abs();
-                        let width = bit_length(mag);
-                        let sig14 = if width >= 14 {
-                            mag >> (width - 14)
-                        } else {
-                            mag << (14 - width)
-                        };
-                        row.group_sum_width = F::from_canonical_u64(width);
-                        let exp = group_max_product_exponent + width - 14;
-                        debug_assert!(exp >= FP22_ZERO_SENTINEL, "nonzero outputs never drop below the sentinel");
-                        OutTriple {
-                            sign: total < 0,
-                            exp,
-                            sig14,
-                        }
-                    };
-                    row.group_output_exponent = F::from_canonical_u64(out.exp);
-                    row.group_output_significand = F::from_canonical_u64(out.sig14);
-
-                    let (promotion, projected) = promotion_witness::<F>(global, out);
-                    let exact_binade = projected.exp - promotion.binade_correction.to_canonical_u64();
-                    row.promotion = promotion;
-                    let global_out = if is_window_final { projected } else { global };
-                    global = global_out;
-
-                    if is_final {
-                        let bits = u64::from(global.to_f32().to_bits());
-                        row.cell_result_f32_lo = F::from_canonical_u64(bits & 0xFFFF);
-                        row.cell_result_f32_hi = F::from_canonical_u64(bits >> 16);
-                    }
-                    // M covers each exact unrounded C+c, while Z covers each chained local c.
-                    e_cell = e_cell.max(exact_binade);
-                    if out.sig14 != 0 {
-                        // Add 5 to convert e(c)+139 to Hopper's grid encoding e(c)-13+157.
-                        e_z_window = e_z_window.max(out.exp + 5);
-                    }
-                    if is_window_final {
-                        e_z_windows.push(e_z_window);
-                        e_z_window = 0;
-                        incoming_carry_is_zero = true;
-                        carry = OutTriple::ZERO;
-                    } else {
-                        incoming_carry_is_zero = total == 0;
-                        carry = out;
-                    }
-                    rows.push(row.into());
-                }
-
-                // ---- M13-M16 post-pass: fill cell/window anchors and the skip census. ----
-                let map = MATMUL_COL_MAP;
-                let mut cell_skips = 0u64;
-                for (j, row) in rows[cell_start..].iter_mut().enumerate() {
-                    let e_grid = e_cell.max(e_z_windows[j / 4]);
-                    row[map.e_cell] = F::from_canonical_u64(e_cell);
-                    row[map.e_grid] = F::from_canonical_u64(e_grid);
-                    row[map.cell_nonzero] = F::from_bool(e_grid != 0);
-                    for i in 0..GROUP_WIDTH {
-                        let lambda_a = a_lambdas[r * k + j * GROUP_WIDTH + i];
-                        let lambda_b = b_lambdas[c * k + j * GROUP_WIDTH + i];
-                        let skipped = skip(lambda_a, lambda_b, e_grid);
-                        row[map.skip_flag[i]] = F::from_bool(skipped);
-                        cell_skips += u64::from(skipped);
-                    }
-                    row[map.cell_skips] = F::from_canonical_u64(cell_skips);
-                }
-            }
-        }
-
-        // ---- Trailing padding: one all-zero single-row phantom cell per padding row. ----
-        for _ in 0..num_rows - self.live_rows() {
-            rows.push(phantom_row::<F>().into());
-        }
-
-        // ---- Fill cell and window schedule witnesses for live and phantom rows. ----
-        let map = MATMUL_COL_MAP;
-        for (i, row) in rows.iter_mut().enumerate() {
-            let s = MatmulScheduleView::<F>::at(i, live_rows_per_cell, w, h * w);
-            row[map.is_cell_final] = s.is_cell_final;
-            row[map.is_padding] = s.is_padding;
-            row[map.cell_step] = s.cell_step;
-            row[map.cell_step_inv] = s.cell_step_inv;
-            row[map.out_row] = s.out_row;
-            row[map.out_col] = s.out_col;
-            row[map.padding_onset_inv] = s.padding_onset_inv;
-            row[map.operand_index_base_a] = s.operand_index_base_a;
-            row[map.operand_index_base_b] = s.operand_index_base_b;
-            row[map.col_carry] = s.col_carry;
-            row[map.col_carry_inv] = s.col_carry_inv;
-            // The H100-only window gadget: the in-window atom position and its bound witness.
-            let step = if row[map.is_padding] == F::ONE {
-                0
-            } else {
-                (i % live_rows_per_cell) % WINDOW_ATOMS
-            };
-            let is_window_final = row[map.is_cell_final] == F::ONE || step == WINDOW_ATOMS - 1;
-            row[map.window_step] = F::from_canonical_usize(step);
-            row[map.window_step_inv] = (F::from_canonical_usize(step) - F::from_canonical_usize(WINDOW_ATOMS - 1))
+        // Cells are independent, so the trace fills one chunk of `rows_per_cell` (one cell)
+        // per parallel job; the schedule's inverse witnesses take only a handful of distinct
+        // values each, precomputed once below instead of inverted per row.
+        let step_inv: Vec<F> = (0..live_rows_per_cell)
+            .map(|s| {
+                (F::from_canonical_usize(s) - F::from_canonical_usize(live_rows_per_cell - 1))
+                    .try_inverse()
+                    .unwrap_or(F::ZERO)
+            })
+            .collect();
+        let col_inv: Vec<F> = (0..w)
+            .map(|c| {
+                (F::from_canonical_usize(c) - F::from_canonical_usize(w - 1))
+                    .try_inverse()
+                    .unwrap_or(F::ZERO)
+            })
+            .collect();
+        let window_inv: [F; WINDOW_ATOMS] = std::array::from_fn(|s| {
+            (F::from_canonical_usize(s) - F::from_canonical_usize(WINDOW_ATOMS - 1))
                 .try_inverse()
-                .unwrap_or(F::ZERO);
-            row[map.is_window_final] = F::from_bool(is_window_final);
+                .unwrap_or(F::ZERO)
+        });
+
+        let mut rows: Vec<[F; NUM_MATMUL_COLUMNS]> = vec![[F::ZERO; NUM_MATMUL_COLUMNS]; num_rows];
+        {
+            let live = self.live_rows();
+            let map = MATMUL_COL_MAP;
+            let rows = &mut rows;
+            // ---- Live cells: one chunk of `rows_per_cell` rows per cell. ----
+            use plonky2_maybe_rayon::MaybeParChunksMut;
+            rows[..live]
+                .par_chunks_mut(live_rows_per_cell)
+                .enumerate()
+                .for_each(|(cell, chunk)| {
+                    let (r, c) = (cell / w, cell % w);
+                    let cell_f = F::from_canonical_usize(cell);
+                    let (out_row, out_col) = (cell / w, cell % w);
+                    let (padding_onset_inv, col_carry, col_carry_inv, base_a, base_b) = (
+                        (cell_f - F::from_canonical_usize(h * w)).try_inverse().unwrap_or(F::ZERO),
+                        F::from_bool(c == w - 1),
+                        col_inv[c],
+                        F::from_canonical_usize(r * k),
+                        F::from_canonical_usize(h * k + c * k),
+                    );
+                    // ---- The k/32 live group-steps (group-sum emulation columns). ----
+                    let mut carry = OutTriple::ZERO;
+                    let mut incoming_carry_is_zero = true;
+                    let mut global = GlobalTriple::ZERO;
+                    // Consolidated policy anchors, filled in after the cell replay.
+                    let mut e_cell = 0u64;
+                    let mut e_z_window = 0u64;
+                    let mut e_z_windows = Vec::with_capacity(live_rows_per_cell.div_ceil(4));
+                    for (j, row_slot) in chunk.iter_mut().enumerate() {
+                        let is_final = j == live_rows_per_cell - 1;
+                        let is_window_final = (j + 1).is_multiple_of(4) || is_final;
+                        let mut row = MatmulColumnsView {
+                            is_cell_final: F::from_bool(is_final),
+                            is_window_final: F::from_bool(is_window_final),
+                            incoming_carry_is_zero: F::from_bool(incoming_carry_is_zero),
+                            ..Default::default()
+                        };
+
+                        // Decode the 32 lanes and receive their summand scores.
+                        let mut lanes = [Fp8Product::ZERO; GROUP_WIDTH];
+                        for i in 0..GROUP_WIDTH {
+                            let operand_codes_a = a_codes[r * k + j * GROUP_WIDTH + i];
+                            let operand_codes_b = b_codes[c * k + j * GROUP_WIDTH + i];
+                            lanes[i] = Fp8Product::new(operand_codes_a, operand_codes_b);
+                            row.operand_codes_a[i] = F::from_canonical_u8(operand_codes_a);
+                            row.operand_codes_b[i] = F::from_canonical_u8(operand_codes_b);
+                            row.prod_fp22_exp[i] = F::from_canonical_u64(lanes[i].fp22_exp);
+                            row.lambda_a[i] = F::from_canonical_u64(a_lambdas[r * k + j * GROUP_WIDTH + i]);
+                            row.lambda_b[i] = F::from_canonical_u64(b_lambdas[c * k + j * GROUP_WIDTH + i]);
+                            // M13: the lane's binade, as served by PRODALIGN15.
+                            let lane_binade = lanes[i].biased_binade();
+                            row.lane_binades[i] = F::from_canonical_u64(lane_binade);
+                            e_cell = e_cell.max(lane_binade);
+                            if lane_binade != 0 {
+                                // Add 5 to convert e(product)+139 to Hopper's grid encoding e(product)-13+157.
+                                e_z_window = e_z_window.max(lane_binade + 5);
+                            }
+                        }
+
+                        // The group's max FP22 exponent over the nonzero terms (zero terms never set
+                        // the max, mirroring the simulator's -139 sentinel); the free witness on
+                        // all-zero rows is pinned to the products' sentinel — the honest max of a
+                        // row of sentinels — so every PRODALIGN15 key stays in-domain (shift 0) and
+                        // the attainment chain vanishes through the sentinel factors.
+                        let mut group_max_product_exponent: Option<u64> = (!incoming_carry_is_zero).then_some(carry.exp);
+                        for lane in &lanes {
+                            if !lane.is_zero {
+                                group_max_product_exponent =
+                                    Some(group_max_product_exponent.map_or(lane.fp22_exp, |m| m.max(lane.fp22_exp)));
+                            }
+                        }
+                        let group_max_product_exponent = group_max_product_exponent.unwrap_or(FP22_ZERO_SENTINEL);
+                        row.group_max_product_exponent = F::from_canonical_u64(group_max_product_exponent);
+                        // The M3 attainment chain: running products of the affine lane factors
+                        // F_i = GROUP_MAX_PRODUCT_EXPONENT - PROD_FP22_EXP_i (three into the first link, two per link
+                        // after, the last one alone) — the definitional fill of the link equalities.
+                        let factor = |i: usize| F::from_canonical_u64(group_max_product_exponent) - row.prod_fp22_exp[i];
+                        row.max_exponent_attainment[0] = factor(0) * factor(1) * factor(2);
+                        for j in 1..NUM_ATT_LINKS - 1 {
+                            row.max_exponent_attainment[j] =
+                                row.max_exponent_attainment[j - 1] * factor(2 * j + 1) * factor(2 * j + 2);
+                        }
+                        row.max_exponent_attainment[NUM_ATT_LINKS - 1] =
+                            row.max_exponent_attainment[NUM_ATT_LINKS - 2] * factor(GROUP_WIDTH - 1);
+
+                        // Align the 33 terms to the max exponent and sum exactly, as `_group_sum`:
+                        // products at the 15-bit frame `sig_a*sig_b*2^7 = (sig << 17) >> 10`, the
+                        // carry at its 14-bit significand, both floor-shifted towards zero.
+                        let mut total: i64 = 0;
+                        for i in 0..GROUP_WIDTH {
+                            if lanes[i].is_zero {
+                                continue; // ALIGNED_LANE_TERMS stays 0 (the table's zero-pair rows hold 0).
+                            }
+                            let shift = group_max_product_exponent - lanes[i].fp22_exp; // >= 0: max dominates.
+                            let mag = ((lanes[i].sig << 7) >> shift.min(63)) as i64;
+                            row.aligned_lane_terms[i] = if lanes[i].sign {
+                                -F::from_canonical_u64(mag as u64)
+                            } else {
+                                F::from_canonical_u64(mag as u64)
+                            };
+                            total += if lanes[i].sign { -mag } else { mag };
+                        }
+                        if incoming_carry_is_zero {
+                            // Canonical witness on the inactive carry path.
+                            row.incoming_carry_shift_power = F::ONE;
+                        } else {
+                            let shift = (group_max_product_exponent - carry.exp).min(CARRY_SHIFT_CAP); // POW2G's min-cap.
+                            let shift_pow2 = 1u64 << shift;
+                            let aligned = carry.sig14 >> shift;
+                            let remainder = carry.sig14 - aligned * shift_pow2;
+                            row.incoming_carry_shift_power = F::from_canonical_u64(shift_pow2);
+                            row.aligned_incoming_carry = F::from_canonical_u64(aligned);
+                            row.incoming_carry_remainder = F::from_canonical_u64(remainder);
+                            total += if carry.sign { -(aligned as i64) } else { aligned as i64 };
+                        }
+
+                        // Sum, renormalize (WIDTHNORM semantics), and emit through the output mux.
+                        row.group_sum_sign = F::from_bool(total < 0);
+                        row.group_sum_abs = F::from_canonical_u64(total.unsigned_abs());
+                        row.group_sum_is_zero = F::from_bool(total == 0);
+                        debug_assert!(total.unsigned_abs() < 1 << 20, "frame sums fit 20 bits");
+                        let out = if total == 0 {
+                            OutTriple::ZERO // The +0 path (Z = GROUP_SUM_IS_ZERO; all-zero rows sum to 0).
+                        } else {
+                            let mag = total.unsigned_abs();
+                            let width = bit_length(mag);
+                            let sig14 = if width >= 14 {
+                                mag >> (width - 14)
+                            } else {
+                                mag << (14 - width)
+                            };
+                            row.group_sum_width = F::from_canonical_u64(width);
+                            let exp = group_max_product_exponent + width - 14;
+                            debug_assert!(exp >= FP22_ZERO_SENTINEL, "nonzero outputs never drop below the sentinel");
+                            OutTriple {
+                                sign: total < 0,
+                                exp,
+                                sig14,
+                            }
+                        };
+                        row.group_output_exponent = F::from_canonical_u64(out.exp);
+                        row.group_output_significand = F::from_canonical_u64(out.sig14);
+
+                        let (promotion, projected) = promotion_witness::<F>(global, out);
+                        let exact_binade = projected.exp - promotion.binade_correction.to_canonical_u64();
+                        row.promotion = promotion;
+                        let global_out = if is_window_final { projected } else { global };
+                        global = global_out;
+
+                        if is_final {
+                            let bits = u64::from(global.to_f32().to_bits());
+                            row.cell_result_f32_lo = F::from_canonical_u64(bits & 0xFFFF);
+                            row.cell_result_f32_hi = F::from_canonical_u64(bits >> 16);
+                        }
+                        // M covers each exact unrounded C+c, while Z covers each chained local c.
+                        e_cell = e_cell.max(exact_binade);
+                        if out.sig14 != 0 {
+                            // Add 5 to convert e(c)+139 to Hopper's grid encoding e(c)-13+157.
+                            e_z_window = e_z_window.max(out.exp + 5);
+                        }
+                        if is_window_final {
+                            e_z_windows.push(e_z_window);
+                            e_z_window = 0;
+                            incoming_carry_is_zero = true;
+                            carry = OutTriple::ZERO;
+                        } else {
+                            incoming_carry_is_zero = total == 0;
+                            carry = out;
+                        }
+
+                        // ---- Schedule witnesses (the shared MS block; values match
+                        // `MatmulScheduleView::at` exactly). ----
+                        row.cell_step = F::from_canonical_usize(j);
+                        row.cell_step_inv = step_inv[j];
+                        row.out_row = F::from_canonical_usize(out_row);
+                        row.out_col = F::from_canonical_usize(out_col);
+                        row.padding_onset_inv = padding_onset_inv;
+                        row.operand_index_base_a = base_a;
+                        row.operand_index_base_b = base_b;
+                        row.col_carry = col_carry;
+                        row.col_carry_inv = col_carry_inv;
+                        // The H100-only window gadget: the in-window atom position and its bound witness.
+                        let step = j % WINDOW_ATOMS;
+                        let is_w_final = is_final || step == WINDOW_ATOMS - 1;
+                        row.window_step = F::from_canonical_usize(step);
+                        row.window_step_inv = window_inv[step];
+                        row.is_window_final = F::from_bool(is_w_final);
+
+                        *row_slot = row.into();
+                    }
+
+                    // ---- M13-M16 post-pass: fill cell/window anchors and the skip census. ----
+                    let mut cell_skips = 0u64;
+                    for (j, row) in chunk.iter_mut().enumerate() {
+                        let e_grid = e_cell.max(e_z_windows[j / 4]);
+                        row[map.e_cell] = F::from_canonical_u64(e_cell);
+                        row[map.e_grid] = F::from_canonical_u64(e_grid);
+                        row[map.cell_nonzero] = F::from_bool(e_grid != 0);
+                        for i in 0..GROUP_WIDTH {
+                            let lambda_a = a_lambdas[r * k + j * GROUP_WIDTH + i];
+                            let lambda_b = b_lambdas[c * k + j * GROUP_WIDTH + i];
+                            let skipped = skip(lambda_a, lambda_b, e_grid);
+                            row[map.skip_flag[i]] = F::from_bool(skipped);
+                            cell_skips += u64::from(skipped);
+                        }
+                        row[map.cell_skips] = F::from_canonical_u64(cell_skips);
+                    }
+                });
+
+            // ---- Trailing padding: one all-zero single-row phantom cell per padding row,
+            // its schedule columns matching `MatmulScheduleView::at` exactly. ----
+            let live = self.live_rows();
+            rows[live..].par_chunks_mut(1).enumerate().for_each(|(t, chunk)| {
+                let row = &mut chunk[0];
+                *row = phantom_row::<F>().into();
+                let s = MatmulScheduleView::<F>::at(live + t, live_rows_per_cell, w, h * w);
+                row[map.is_cell_final] = s.is_cell_final;
+                row[map.is_padding] = s.is_padding;
+                row[map.cell_step] = s.cell_step;
+                row[map.cell_step_inv] = s.cell_step_inv;
+                row[map.out_row] = s.out_row;
+                row[map.out_col] = s.out_col;
+                row[map.padding_onset_inv] = s.padding_onset_inv;
+                row[map.operand_index_base_a] = s.operand_index_base_a;
+                row[map.operand_index_base_b] = s.operand_index_base_b;
+                row[map.col_carry] = s.col_carry;
+                row[map.col_carry_inv] = s.col_carry_inv;
+                // The H100-only window gadget: the in-window atom position and its bound witness.
+                let step = 0;
+                let is_window_final = row[map.is_cell_final] == F::ONE || step == WINDOW_ATOMS - 1;
+                row[map.window_step] = F::from_canonical_usize(step);
+                row[map.window_step_inv] = window_inv[step];
+                row[map.is_window_final] = F::from_bool(is_window_final);
+            });
         }
 
         (rows, self.public_inputs())
