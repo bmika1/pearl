@@ -865,12 +865,19 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         let mut checker = LutChecker::<F>::new(&self.lut_tables);
         for (table, lookups) in lut_inventories::<F>(self.device(), &self.scale.program) {
             let t = usize::from(table);
+            let label = format!("trace: lut-check {table:?}");
+            timing.push(&label, log::Level::Debug);
             checker
                 .check_trace(&lookups, &traces[t], &generated[t], &format!("{table:?}"))
                 .map_err(|e| anyhow!(e))?;
+            timing.pop();
         }
         for table in self.lut_tables {
-            traces.push(lut_trace::<F>(table, checker.multiplicities.table_columns(table)));
+            let label = format!("trace: lut-trace {table:?}");
+            timing.push(&label, log::Level::Debug);
+            let trace = lut_trace::<F>(table, checker.multiplicities.table_columns(table));
+            timing.pop();
+            traces.push(trace);
         }
 
         // ---- The traces were assembled in canonical order, which is the batch order. ----

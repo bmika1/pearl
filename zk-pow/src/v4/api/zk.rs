@@ -83,6 +83,7 @@ use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::types::Field;
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use plonky2::plonk::proof::ProofWithPublicInputs;
+use plonky2::timed;
 use plonky2::util::timing::TimingTree;
 use starky::batch_proof::BatchStarkProofWithPublicInputs;
 use starky::batch_prover::BatchStarkPreprocessedData;
@@ -781,8 +782,16 @@ fn prove_batch_statement(
     setup: &Fp8ProverSetup,
     timing: &mut TimingTree,
 ) -> Result<(PublicParams, Fp8Job, BatchStarkProofWithPublicInputs<F, C, D>)> {
-    let (private, mut public) = plain_proof.parse_proof(proposed_header)?;
-    let mut job = Fp8Job::derive(&public, proposed_header)?;
+    let (private, mut public) = timed!(
+        timing,
+        "parse plain proof",
+        plain_proof.parse_proof(proposed_header)?
+    );
+    let mut job = timed!(
+        timing,
+        "derive job",
+        Fp8Job::derive(&public, proposed_header)?
+    );
     ensure!(
         setup.device == public.common().device,
         "the FP8 prover setup is for {:?}, but the statement commits {:?}",
@@ -803,8 +812,14 @@ fn prove_batch_statement(
     // jobs) as u32 words, stream order — `parse_proof` already Merkle-verified them against
     // `moe.hash_routing`/`moe.hash_offsets` and checked the sampled entries against the
     // public outer indices.
-    let routing_words = stream_words(&private.s_routing);
-    let offsets_words = stream_words(&private.s_offsets);
+    let (routing_words, offsets_words) = timed!(
+        timing,
+        "stream routing words",
+        (
+            stream_words(&private.s_routing),
+            stream_words(&private.s_offsets),
+        )
+    );
     let witness = Fp8Witness {
         a_values: private.operands.a.values.as_bytes(),
         a_scales: private.operands.a.scales.as_bytes(),
