@@ -10,7 +10,7 @@ use plonky2_field::packed::PackedField;
 use plonky2_field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
-use plonky2_util::{log2_strict, reverse_index_bits_in_place};
+use plonky2_util::log2_strict;
 
 use crate::batch_fri::batch_alpha_runs;
 use crate::batch_fri::prover::batch_fri_proof_with_openings;
@@ -21,11 +21,26 @@ use crate::fri::FriParams;
 use crate::hash::batch_merkle_tree::BatchMerkleTree;
 use crate::hash::hash_types::RichField;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::{GenericConfig, GenericHashOut, Hasher};
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
-use crate::util::{reverse_bits, transpose};
+use crate::util::{reverse_bits, transpose_bitrev};
+
+/// Hash commitment leaf rows into Merkle leaves (as field-element vectors).
+///
+/// Specializes the generic `C::Hasher::hash_no_pad` path: when the hasher
+/// exposes SIMD batch hashing (`hash_no_pad_batch`) and the leaf width is a
+/// multiple of the sponge rate, rows are hashed in SIMD-width batches, one
+/// lane per row. Otherwise each row is hashed with the scalar hasher, in
+/// parallel.
+fn hash_leaf_rows<F, C, const D: usize>(rows: &[Vec<F>]) -> Vec<Vec<F>>
+where
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+{
+    C::Hasher::hash_no_pad_batch(rows)
+}
 
 /// Represents a batch FRI oracle, i.e. a batch of polynomials with different degrees which have
 /// been Merkle-ized in a [`BatchMerkleTree`].
@@ -104,8 +119,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     )
                 );
 
-                let mut leaf_group = timed!(timing, "transpose LDEs", transpose(&lde_values));
-                reverse_index_bits_in_place(&mut leaf_group);
+                let leaf_group = timed!(timing, "transpose LDEs", transpose_bitrev(&lde_values));
                 leaves.push(leaf_group);
 
                 group_start = i + 1;
@@ -171,12 +185,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         None,
                     )
                 );
-                let mut rows = timed!(timing, "transpose LDEs", transpose(&lde));
-                timed!(
-                    timing,
-                    "bit-reverse leaf rows",
-                    reverse_index_bits_in_place(&mut rows)
-                );
+                let rows = timed!(timing, "transpose LDEs", transpose_bitrev(&lde));
                 rows
             })
             .collect();
@@ -185,11 +194,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             "hash digest leaves",
             row_values
                 .iter()
-                .map(|rows| {
-                    rows.par_iter()
-                        .map(|row| C::Hasher::hash_no_pad(row).to_vec())
-                        .collect()
-                })
+                .map(|rows| hash_leaf_rows::<F, C, D>(rows))
                 .collect()
         );
         let batch_merkle_tree = timed!(

@@ -161,33 +161,33 @@ pub fn hash_n_to_hash_no_pad<F: RichField, P: PlonkyPermutation<F>>(inputs: &[F]
 /// cost across lanes; for the Merkle-leaf use case (one RATE chunk) it
 /// reduces the hashing work per leaf to roughly one packed permutation.
 ///
-/// Requires every message to have the same length and to be a multiple of
-/// the sponge RATE, as produced by `hash_no_pad` callers with fixed-width
-/// leaves.
+/// Requires every message to have the same length (fixed-width leaves);
+/// lengths need not be a multiple of the sponge rate — the final partial
+/// chunk overwrites only the first `chunk_len` state slots, exactly like
+/// the scalar sponge.
 pub fn poseidon_hash_batch_no_pad<F, P>(messages: &[&[F]]) -> Vec<HashOut<F>>
 where
-    F: RichField + Extendable<2>,
+    F: RichField,
     P: PackedField<Scalar = F>,
 {
     assert!(!messages.is_empty());
     assert!(messages.len() <= P::WIDTH);
     let len = messages[0].len();
     assert!(messages.iter().all(|m| m.len() == len));
-    assert!(
-        len % SPONGE_RATE == 0,
-        "batched hashing expects RATE-multiple lengths"
-    );
 
     let width = messages.len();
     debug_assert!(width <= P::WIDTH);
     let mut state = [P::ZEROS; SPONGE_WIDTH];
 
     // Absorb all input chunks, overwriting the sponge rate portion like
-    // `hash_n_to_m_no_pad`. Lane k absorbs messages[k]; unused lanes stay
-    // zero, which keeps them independent of the hashed lanes.
+    // `hash_n_to_m_no_pad`. A partial final chunk overwrites only its own
+    // slots; the rest keep their pre-permutation values, matching the
+    // scalar sponge. Lane k absorbs messages[k]; unused lanes stay zero,
+    // which keeps them independent of the hashed lanes.
     let mut lane = vec![F::ZERO; P::WIDTH];
     for chunk_start in (0..len).step_by(SPONGE_RATE) {
-        for i in 0..SPONGE_RATE {
+        let chunk_len = SPONGE_RATE.min(len - chunk_start);
+        for i in 0..chunk_len {
             for (k, msg) in messages.iter().enumerate() {
                 lane[k] = msg[chunk_start + i];
             }
@@ -221,8 +221,10 @@ mod packed_tests {
 
     #[test]
     fn packed_batch_hash_matches_scalar() {
-        // RATE-multiple lengths, mirroring commitment leaf rows.
-        for len in [SPONGE_RATE, 2 * SPONGE_RATE, 3 * SPONGE_RATE] {
+        // RATE-multiple and partial-chunk lengths (v4 digest leaf widths
+        // like 237 are not RATE multiples; the final partial chunk must
+        // overwrite only its own sponge slots).
+        for len in [SPONGE_RATE, 2 * SPONGE_RATE, 3 * SPONGE_RATE, 237, 222, 339, 5] {
             let msgs: Vec<Vec<F>> = (0..P::WIDTH)
                 .map(|k| {
                     (0..len)
