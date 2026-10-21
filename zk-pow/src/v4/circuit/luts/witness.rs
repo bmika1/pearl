@@ -137,18 +137,6 @@ impl LutMultiplicities {
     pub fn table_total(&self, table: LutTable) -> u64 {
         self.counts[self.table_position(table)].iter().flatten().sum()
     }
-
-    /// Adds `other`'s counters into `self` (exact: u64 addition commutes).
-    fn merge_from(&mut self, other: LutMultiplicities) {
-        debug_assert_eq!(self.tables, other.tables);
-        for (dst, src) in self.counts.iter_mut().zip(other.counts) {
-            for (dst_slot, src_slot) in dst.iter_mut().zip(src) {
-                for (dst_row, src_row) in dst_slot.iter_mut().zip(src_slot) {
-                    *dst_row += src_row;
-                }
-            }
-        }
-    }
 }
 
 /// Debug/test-side oracle checker: walks LUT instance inventories over honest traces, checks
@@ -176,7 +164,9 @@ impl<F: PrimeField64> LutChecker<F> {
     ///
     /// Rows are processed in parallel chunks, each accumulating into its own multiplicity
     /// counters; the chunks merge exactly (u64 addition commutes), and the first error in row
-    /// order — identical to the serial walk — is reported.
+    /// order — identical to the serial walk — is reported. Per-chunk state stays minimal:
+    /// counters are allocated only for the tables this inventory touches, and the generated
+    /// table outputs are materialized once and shared immutably across chunks.
     pub fn check_trace(
         &mut self,
         lookups: &[LutLookup<F>],
@@ -192,22 +182,39 @@ impl<F: PrimeField64> LutChecker<F> {
         }
         // Chunk boundaries: fixed-size chunks of >= 2^16 rows, capped at 256
         // chunks — enough to fill any pool while keeping per-chunk counter
-        // allocation (tables x slots x height u64s) amortized. The big tables
-        // (2^21..2^22 rows) dominate; smaller ones fall back to one chunk.
+        // allocation amortized. The big tables (2^21..2^22 rows) dominate;
+        // smaller ones fall back to one chunk.
         let chunk_rows = (num_rows / 256).max(1 << 16).min(num_rows);
         let num_chunks = num_rows.div_ceil(chunk_rows);
         debug_assert!(chunk_rows * num_chunks >= num_rows);
 
-        let tables = self.multiplicities.tables.clone();
+        // The distinct tables this inventory touches — chunk counters are
+        // allocated for these only, not for the full committed set.
+        let inventory_tables: Vec<LutTable> = {
+            let mut t: Vec<LutTable> = lookups.iter().map(|l| l.table).collect();
+            t.sort_unstable();
+            t.dedup();
+            t
+        };
+        // Generated outputs, materialized once and shared across chunks
+        // (the generator is deterministic per (table, slot)).
+        let outputs: BTreeMap<(LutTable, usize), Vec<Vec<F>>> = {
+            let mut m = BTreeMap::new();
+            for &table in &inventory_tables {
+                for slot in 0..num_slots(table) {
+                    m.insert((table, slot), generate::<F>(table, slot));
+                }
+            }
+            m
+        };
+
         let chunk_results: Vec<Result<LutMultiplicities, String>> = (0..num_chunks)
             .into_par_iter()
             .map(|chunk| {
                 let row_lo = chunk * chunk_rows;
                 let row_hi = (row_lo + chunk_rows).min(num_rows);
-                let mut counts = LutMultiplicities::new(&tables);
-                // Per-chunk cache of generated table outputs, mirroring the
-                // serial checker's cross-inventory cache.
-                let mut outputs_cache: BTreeMap<(LutTable, usize), Vec<Vec<F>>> = BTreeMap::new();
+                // Counters for this chunk: only the inventory's tables.
+                let mut counts = LutMultiplicities::new(&inventory_tables);
                 for (li, lookup) in lookups.iter().enumerate() {
                     let table_position = counts.table_position(lookup.table);
                     let chunk_counts = &mut counts.counts[table_position];
@@ -231,12 +238,7 @@ impl<F: PrimeField64> LutChecker<F> {
                             .map(|c| c.eval_table(trace, row, public_inputs).to_canonical_u64())
                             .collect();
                         let (slot, table_row) = LutMultiplicities::resolve(lookup.table, &keys, &values).map_err(err)?;
-                        // Value checks need the generated table outputs; the
-                        // generator is deterministic per (table, slot), so
-                        // each chunk materializes its own cached copy.
-                        let outputs = outputs_cache
-                            .entry((lookup.table, slot))
-                            .or_insert_with(|| generate::<F>(lookup.table, slot));
+                        let outputs = &outputs[&(lookup.table, slot)];
                         // BYTES2/PAIR128 bind only their key tuple, already checked by resolution.
                         let expected_arity = match lookup.table {
                             LutTable::Bytes2 | LutTable::Pair128 => 0,
@@ -262,10 +264,21 @@ impl<F: PrimeField64> LutChecker<F> {
 
         // Merge in row order; surface the first error exactly as the serial walk would.
         let mut first_err = None;
-        let mut merged = LutMultiplicities::new(&tables);
         for res in chunk_results {
             match res {
-                Ok(counts) => merged.merge_from(counts),
+                Ok(counts) => {
+                    for (table_position, src) in counts.counts.into_iter().enumerate() {
+                        let table = counts.tables[table_position];
+                        let dst_position = self.multiplicities.table_position(table);
+                        for (dst_slot, src_slot) in
+                            self.multiplicities.counts[dst_position].iter_mut().zip(src)
+                        {
+                            for (dst_row, src_row) in dst_slot.iter_mut().zip(src_slot) {
+                                *dst_row += src_row;
+                            }
+                        }
+                    }
+                }
                 Err(e) => {
                     if first_err.is_none() {
                         first_err = Some(e);
@@ -276,8 +289,6 @@ impl<F: PrimeField64> LutChecker<F> {
         if let Some(e) = first_err {
             return Err(e);
         }
-        // Fold the merged chunk counters into the checker's public state.
-        self.multiplicities.merge_from(merged);
         Ok(())
     }
 }
