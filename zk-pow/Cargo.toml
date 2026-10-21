@@ -45,6 +45,3 @@ debug-assertions = true
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["disable_initial_exec_tls"] }
-
-[dev-dependencies]
-tikv-jemallocator = { version = "0.6", features = ["disable_initial_exec_tls"] }

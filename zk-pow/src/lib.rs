@@ -4,17 +4,6 @@
 //! [`ffi`] is the binding layer shared by the Go and Python bindings: it may import
 //! from every version, and no version imports it.
 
-/// Test binaries link the library's `#[cfg(test)]` code into a fresh harness
-/// executable, which otherwise defaults to the system malloc. Production
-/// binaries (Go FFI, Python bindings, prove_verify) all register jemalloc as
-/// the global allocator; benchmarking without it attributes glibc malloc
-/// churn (page-table/syscall overhead in the transpose-heavy commitment
-/// phases) to the prover. Register the same allocator for test executables
-/// so benches measure the prover, not the allocator.
-#[cfg(all(test, unix))]
-#[global_allocator]
-static TEST_GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
 pub mod ffi;
 pub mod v1;
 pub mod v2;
