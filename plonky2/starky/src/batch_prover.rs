@@ -435,10 +435,15 @@ where
     };
 
     // Compute the auxiliary polynomials (lookup helpers, then CTL helpers and Zs) of each table.
+    // Tables are independent (each reads only its own trace, public inputs and CTL
+    // data), so process them in parallel; `collect` preserves table order. Helper
+    // columns within a table stay parallel as before — most tables expose only a
+    // handful of helpers, so the table-level parallelism is what saturates the box.
     let aux_polys_per_table: Vec<Vec<PolynomialValues<F>>> = timed!(
         timing,
         "compute auxiliary polynomials",
         (0..N)
+            .into_par_iter()
             .map(|t| {
                 let mut aux = lookup_challenges_of(t)
                     .map(|challenges| {
