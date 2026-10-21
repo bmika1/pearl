@@ -21,24 +21,30 @@ use crate::fri::FriParams;
 use crate::hash::batch_merkle_tree::BatchMerkleTree;
 use crate::hash::hash_types::RichField;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::{GenericConfig, Hasher};
+use crate::plonk::config::{GenericConfig, GenericHashOut, Hasher};
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
-use crate::util::{reverse_bits, transpose_bitrev};
+use crate::util::{reverse_bits, transpose_bitrev, transpose_bitrev_flat, FlatRows};
 
 /// Hash commitment leaf rows into Merkle leaves (as field-element vectors).
 ///
-/// Delegates to the hasher's `hash_no_pad_batch`, which by default hashes
-/// rows in parallel with the scalar `hash_no_pad`; hashers with SIMD batch
-/// implementations may override it to amortize permutation work across
-/// lanes.
-fn hash_leaf_rows<F, C, const D: usize>(rows: &[Vec<F>]) -> Vec<Vec<F>>
+/// Takes flat rows: the digest-path transpose emits one row per LDE point —
+/// millions of rows at mining geometries — and hashing each row with the
+/// scalar `hash_no_pad` (the trait's `hash_no_pad_batch` default) avoids
+/// re-introducing one `Vec` allocation per row. The packed SIMD override of
+/// `hash_no_pad_batch` measured slower than scalar on H100 and is not wired
+/// in (see the revert commit), so batching buys nothing here.
+fn hash_leaf_rows_flat<F, C, const D: usize>(rows: &FlatRows<F>) -> Vec<Vec<F>>
 where
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
 {
-    C::Hasher::hash_no_pad_batch(rows)
+    let num_rows = rows.num_rows();
+    (0..num_rows)
+        .into_par_iter()
+        .map(|i| C::Hasher::hash_no_pad(rows.row(i)).to_vec())
+        .collect()
 }
 
 /// Represents a batch FRI oracle, i.e. a batch of polynomials with different degrees which have
@@ -53,7 +59,7 @@ pub struct BatchFriOracle<F: RichField + Extendable<D>, C: GenericConfig<D, F = 
     pub rate_bits: usize,
     pub blinding: bool,
     // Digest trees retain raw rows for quotient evaluation and FRI openings.
-    row_values: Vec<Vec<Vec<F>>>,
+    row_values: Vec<FlatRows<F>>,
     leaf_ranges: Vec<Range<usize>>,
 }
 
@@ -184,8 +190,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         None,
                     )
                 );
-                let rows = timed!(timing, "transpose LDEs", transpose_bitrev(&lde));
-                rows
+                timed!(timing, "transpose LDEs", transpose_bitrev_flat(&lde))
             })
             .collect();
         let leaves = timed!(
@@ -193,7 +198,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             "hash digest leaves",
             row_values
                 .iter()
-                .map(|rows| hash_leaf_rows::<F, C, D>(rows))
+                .map(|rows| hash_leaf_rows_flat::<F, C, D>(rows))
                 .collect()
         );
         let batch_merkle_tree = timed!(
@@ -220,7 +225,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let mut values = vec![F::ZERO; self.polynomials.len()];
         for (i, range) in self.leaf_ranges.iter().enumerate() {
             let row = index >> (self.degree_bits[0] - self.degree_bits[i]);
-            values[range.clone()].copy_from_slice(&self.row_values[i][row]);
+            values[range.clone()].copy_from_slice(self.row_values[i].row(row));
         }
         values
     }
@@ -325,12 +330,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) -> &[F] {
         let index = index * step;
         let index = reverse_bits(index, self.degree_bits[degree_bits_index] + self.rate_bits);
-        let rows = if self.row_values.is_empty() {
-            &self.batch_merkle_tree.leaves
+        let slice = if self.row_values.is_empty() {
+            &self.batch_merkle_tree.leaves[degree_bits_index][index]
         } else {
-            &self.row_values
+            self.row_values[degree_bits_index].row(index)
         };
-        let slice = &rows[degree_bits_index][index];
         &slice[slice_start..slice_start + slice_len]
     }
 
