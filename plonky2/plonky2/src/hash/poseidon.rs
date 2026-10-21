@@ -14,14 +14,11 @@ use crate::gates::gate::Gate;
 use crate::gates::poseidon::PoseidonGate;
 use crate::gates::poseidon_mds::PoseidonMdsGate;
 use crate::hash::hash_types::{HashOut, RichField};
-use crate::hash::hashing::{
-    compress, hash_n_to_hash_no_pad, poseidon_hash_batch_no_pad, PlonkyPermutation,
-};
+use crate::hash::hashing::{compress, hash_n_to_hash_no_pad, PlonkyPermutation};
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::{BoolTarget, Target};
 use crate::plonk::circuit_builder::CircuitBuilder;
-use crate::plonk::config::{AlgebraicHasher, GenericHashOut, Hasher};
-use plonky2_maybe_rayon::*;
+use crate::plonk::config::{AlgebraicHasher, Hasher};
 
 pub const SPONGE_RATE: usize = 8;
 pub const SPONGE_CAPACITY: usize = 4;
@@ -799,8 +796,8 @@ pub trait Poseidon: PrimeField64 {
         // Full rounds, first half.
         for round_ctr in 0..HALF_N_FULL_ROUNDS {
             for i in 0..SPONGE_WIDTH {
-                state[i] += Self::from_canonical_u64(ALL_ROUND_CONSTANTS
-                    [i + SPONGE_WIDTH * round_ctr]);
+                state[i] +=
+                    Self::from_canonical_u64(ALL_ROUND_CONSTANTS[i + SPONGE_WIDTH * round_ctr]);
             }
             for i in 0..SPONGE_WIDTH {
                 // x |--> x^7, via packed square/mul.
@@ -838,9 +835,10 @@ pub trait Poseidon: PrimeField64 {
             result[0] = state[0];
             for r in 1..SPONGE_WIDTH {
                 for c in 1..SPONGE_WIDTH {
-                    result[c] += state[r] * Self::from_canonical_u64(
-                        Self::FAST_PARTIAL_ROUND_INITIAL_MATRIX[r - 1][c - 1],
-                    );
+                    result[c] += state[r]
+                        * Self::from_canonical_u64(
+                            Self::FAST_PARTIAL_ROUND_INITIAL_MATRIX[r - 1][c - 1],
+                        );
                 }
             }
             state = result;
@@ -866,8 +864,8 @@ pub trait Poseidon: PrimeField64 {
             result[0] = d;
             let s0 = state[0];
             for i in 1..SPONGE_WIDTH {
-                result[i] = s0 * Self::from_canonical_u64(Self::FAST_PARTIAL_ROUND_VS[r][i - 1])
-                    + state[i];
+                result[i] =
+                    s0 * Self::from_canonical_u64(Self::FAST_PARTIAL_ROUND_VS[r][i - 1]) + state[i];
             }
             state = result;
         }
@@ -876,8 +874,8 @@ pub trait Poseidon: PrimeField64 {
         for offset in 0..HALF_N_FULL_ROUNDS {
             let round_ctr = HALF_N_FULL_ROUNDS + N_PARTIAL_ROUNDS + offset;
             for i in 0..SPONGE_WIDTH {
-                state[i] += Self::from_canonical_u64(ALL_ROUND_CONSTANTS
-                    [i + SPONGE_WIDTH * round_ctr]);
+                state[i] +=
+                    Self::from_canonical_u64(ALL_ROUND_CONSTANTS[i + SPONGE_WIDTH * round_ctr]);
             }
             for i in 0..SPONGE_WIDTH {
                 let x = state[i];
@@ -1010,55 +1008,6 @@ impl<F: RichField> Hasher<F> for PoseidonHash {
 
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash {
         compress::<F, Self::Permutation>(left, right)
-    }
-
-    fn hash_no_pad_batch(rows: &[Vec<F>]) -> Vec<Vec<F>>
-    where
-        F: Send + Sync,
-    {
-        use plonky2_field::packable::Packable;
-
-        type PackingOf<F> = <F as Packable>::Packing;
-
-        // The packed batch path requires SIMD packing (WIDTH > 1); otherwise
-        // use the scalar path. Partial final chunks are handled natively by
-        // the packed sponge.
-        if rows.is_empty() {
-            return Vec::new();
-        }
-        let width = rows[0].len();
-        if width == 0 || PackingOf::<F>::WIDTH == 1 {
-            return rows
-                .par_iter()
-                .map(|row| Self::hash_no_pad(row).to_vec())
-                .collect();
-        }
-
-        // Lanes evolve independently through the permutation, so any grouping
-        // of rows into WIDTH-sized batches (including the tail, with idle
-        // zero lanes) yields identical per-row outputs.
-        let batch = PackingOf::<F>::WIDTH;
-        let mut leaves: Vec<Vec<F>> = Vec::with_capacity(rows.len());
-        {
-            // Split into WIDTH-row blocks; each block is hashed with packed
-            // permutations and blocks run in parallel.
-            let num_batches = rows.len().div_ceil(batch);
-            let out_chunks: Vec<Vec<Vec<F>>> = (0..num_batches)
-                .into_par_iter()
-                .map(|b| {
-                    let block = &rows[b * batch..(b + 1) * batch.min(rows.len() - b * batch)];
-                    let refs: Vec<&[F]> = block.iter().map(|r| &r[..]).collect();
-                    poseidon_hash_batch_no_pad::<F, PackingOf<F>>(&refs)
-                        .into_iter()
-                        .map(|h| h.to_vec())
-                        .collect()
-                })
-                .collect();
-            for chunk in out_chunks {
-                leaves.extend(chunk);
-            }
-        }
-        leaves
     }
 }
 

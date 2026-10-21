@@ -29,11 +29,10 @@ use crate::util::{reverse_bits, transpose_bitrev};
 
 /// Hash commitment leaf rows into Merkle leaves (as field-element vectors).
 ///
-/// Specializes the generic `C::Hasher::hash_no_pad` path: when the hasher
-/// exposes SIMD batch hashing (`hash_no_pad_batch`) and the leaf width is a
-/// multiple of the sponge rate, rows are hashed in SIMD-width batches, one
-/// lane per row. Otherwise each row is hashed with the scalar hasher, in
-/// parallel.
+/// Delegates to the hasher's `hash_no_pad_batch`, which by default hashes
+/// rows in parallel with the scalar `hash_no_pad`; hashers with SIMD batch
+/// implementations may override it to amortize permutation work across
+/// lanes.
 fn hash_leaf_rows<F, C, const D: usize>(rows: &[Vec<F>]) -> Vec<Vec<F>>
 where
     F: RichField + Extendable<D>,

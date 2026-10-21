@@ -93,7 +93,6 @@ pub fn transpose_bitrev<T: Send + Sync + Copy>(matrix: &[Vec<T>]) -> Vec<Vec<T>>
     out
 }
 
-
 /// Evaluate multiple polynomials at multiple points.
 ///
 /// Returns `ret: Vec<Vec<F>>` indexed as `ret[point_idx][poly_idx]`.

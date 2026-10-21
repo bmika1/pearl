@@ -1,12 +1,12 @@
 // Quick benchmark: scalar vs packed batch Poseidon leaf hashing.
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::hash::hash_types::RichField;
-use plonky2_field::packed::PackedField;
-use plonky2_field::types::Field;
 use plonky2::hash::hashing::poseidon_hash_batch_no_pad;
 use plonky2::hash::poseidon::PoseidonHash;
 use plonky2::plonk::config::Hasher;
 use plonky2_field::packable::Packable;
+use plonky2_field::packed::PackedField;
+use plonky2_field::types::Field;
 
 fn main() {
     type F = GoldilocksField;
@@ -17,7 +17,11 @@ fn main() {
     let rows_count = 1 << 18;
     for &w in &widths {
         let rows: Vec<Vec<F>> = (0..rows_count)
-            .map(|r| (0..w).map(|c| F::from_canonical_u64(r as u64 * 31 + c as u64)).collect())
+            .map(|r| {
+                (0..w)
+                    .map(|c| F::from_canonical_u64(r as u64 * 31 + c as u64))
+                    .collect()
+            })
             .collect();
 
         let t0 = std::time::Instant::now();

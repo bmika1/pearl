@@ -224,7 +224,15 @@ mod packed_tests {
         // RATE-multiple and partial-chunk lengths (v4 digest leaf widths
         // like 237 are not RATE multiples; the final partial chunk must
         // overwrite only its own sponge slots).
-        for len in [SPONGE_RATE, 2 * SPONGE_RATE, 3 * SPONGE_RATE, 237, 222, 339, 5] {
+        for len in [
+            SPONGE_RATE,
+            2 * SPONGE_RATE,
+            3 * SPONGE_RATE,
+            237,
+            222,
+            339,
+            5,
+        ] {
             let msgs: Vec<Vec<F>> = (0..P::WIDTH)
                 .map(|k| {
                     (0..len)
