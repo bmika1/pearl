@@ -782,16 +782,8 @@ fn prove_batch_statement(
     setup: &Fp8ProverSetup,
     timing: &mut TimingTree,
 ) -> Result<(PublicParams, Fp8Job, BatchStarkProofWithPublicInputs<F, C, D>)> {
-    let (private, mut public) = timed!(
-        timing,
-        "parse plain proof",
-        plain_proof.parse_proof(proposed_header)?
-    );
-    let mut job = timed!(
-        timing,
-        "derive job",
-        Fp8Job::derive(&public, proposed_header)?
-    );
+    let (private, mut public) = timed!(timing, "parse plain proof", plain_proof.parse_proof(proposed_header)?);
+    let mut job = timed!(timing, "derive job", Fp8Job::derive(&public, proposed_header)?);
     ensure!(
         setup.device == public.common().device,
         "the FP8 prover setup is for {:?}, but the statement commits {:?}",
@@ -815,10 +807,7 @@ fn prove_batch_statement(
     let (routing_words, offsets_words) = timed!(
         timing,
         "stream routing words",
-        (
-            stream_words(&private.s_routing),
-            stream_words(&private.s_offsets),
-        )
+        (stream_words(&private.s_routing), stream_words(&private.s_offsets),)
     );
     let witness = Fp8Witness {
         a_values: private.operands.a.values.as_bytes(),

@@ -137,6 +137,18 @@ impl LutMultiplicities {
     pub fn table_total(&self, table: LutTable) -> u64 {
         self.counts[self.table_position(table)].iter().flatten().sum()
     }
+
+    /// Adds `other`'s counters into `self` (exact: u64 addition commutes).
+    fn merge_from(&mut self, other: LutMultiplicities) {
+        debug_assert_eq!(self.tables, other.tables);
+        for (dst, src) in self.counts.iter_mut().zip(other.counts) {
+            for (dst_slot, src_slot) in dst.iter_mut().zip(src) {
+                for (dst_row, src_row) in dst_slot.iter_mut().zip(src_slot) {
+                    *dst_row += src_row;
+                }
+            }
+        }
+    }
 }
 
 /// Debug/test-side oracle checker: walks LUT instance inventories over honest traces, checks
@@ -146,15 +158,14 @@ impl LutMultiplicities {
 /// reporting the multiset check cannot give.
 pub struct LutChecker<F: PrimeField64> {
     pub multiplicities: LutMultiplicities,
-    /// Generated outputs, cached per (table, slot) across inventories.
-    cache: BTreeMap<(LutTable, usize), Vec<Vec<F>>>,
+    _phantom: core::marker::PhantomData<F>,
 }
 
 impl<F: PrimeField64> LutChecker<F> {
     pub fn new(tables: &[LutTable]) -> Self {
         Self {
             multiplicities: LutMultiplicities::new(tables),
-            cache: BTreeMap::new(),
+            _phantom: core::marker::PhantomData,
         }
     }
 
@@ -162,6 +173,10 @@ impl<F: PrimeField64> LutChecker<F> {
     /// reading filter values as multiplicities (the logup numerator semantics; honest filters
     /// are 0/1). `ctx` tags error messages. `public_inputs` is the host table's public-input
     /// vector (Scale's T3 gate keys read the `DEAD_LIMIT` slots).
+    ///
+    /// Rows are processed in parallel chunks, each accumulating into its own multiplicity
+    /// counters; the chunks merge exactly (u64 addition commutes), and the first error in row
+    /// order — identical to the serial walk — is reported.
     pub fn check_trace(
         &mut self,
         lookups: &[LutLookup<F>],
@@ -169,53 +184,100 @@ impl<F: PrimeField64> LutChecker<F> {
         public_inputs: &[F],
         ctx: &str,
     ) -> Result<(), String> {
+        use plonky2_maybe_rayon::*;
+
         let num_rows = trace[0].len();
-        for (li, lookup) in lookups.iter().enumerate() {
-            let table_position = self.multiplicities.table_position(lookup.table);
-            let counts = &mut self.multiplicities.counts[table_position];
-            for row in 0..num_rows {
-                let err = |e: String| format!("{ctx} lookup {li} ({:?}) row {row}: {e}", lookup.table);
-                let mult = lookup.filter.eval_table(trace, row, public_inputs).to_canonical_u64();
-                if mult == 0 {
-                    continue;
-                }
-                if mult > 1 << 20 {
-                    return Err(err(format!("implausible filter/multiplicity value {mult}")));
-                }
-                let keys: Vec<u64> = lookup
-                    .keys
-                    .iter()
-                    .map(|c| c.eval_table(trace, row, public_inputs).to_canonical_u64())
-                    .collect();
-                let values: Vec<u64> = lookup
-                    .values
-                    .iter()
-                    .map(|c| c.eval_table(trace, row, public_inputs).to_canonical_u64())
-                    .collect();
-                let (slot, table_row) = LutMultiplicities::resolve(lookup.table, &keys, &values).map_err(err)?;
-                let outputs = self
-                    .cache
-                    .entry((lookup.table, slot))
-                    .or_insert_with(|| generate::<F>(lookup.table, slot));
-                // BYTES2/PAIR128 bind only their key tuple, already checked by resolution.
-                let expected_arity = match lookup.table {
-                    LutTable::Bytes2 | LutTable::Pair128 => 0,
-                    _ => outputs.len(),
-                };
-                if values.len() != expected_arity {
-                    return Err(err(format!("binds {} values, table returns {expected_arity}", values.len())));
-                }
-                for (i, &got) in values.iter().enumerate() {
-                    let want = outputs[i][table_row].to_canonical_u64();
-                    if got != want {
-                        return Err(err(format!(
-                            "value {i} = {got:?} differs from {want:?} (slot {slot}, table row {table_row})"
-                        )));
+        if num_rows == 0 {
+            return Ok(());
+        }
+        // Chunk boundaries: fixed-size chunks of >= 2^16 rows, capped at 256
+        // chunks — enough to fill any pool while keeping per-chunk counter
+        // allocation (tables x slots x height u64s) amortized. The big tables
+        // (2^21..2^22 rows) dominate; smaller ones fall back to one chunk.
+        let chunk_rows = (num_rows / 256).max(1 << 16).min(num_rows);
+        let num_chunks = num_rows.div_ceil(chunk_rows);
+        debug_assert!(chunk_rows * num_chunks >= num_rows);
+
+        let tables = self.multiplicities.tables.clone();
+        let chunk_results: Vec<Result<LutMultiplicities, String>> = (0..num_chunks)
+            .into_par_iter()
+            .map(|chunk| {
+                let row_lo = chunk * chunk_rows;
+                let row_hi = (row_lo + chunk_rows).min(num_rows);
+                let mut counts = LutMultiplicities::new(&tables);
+                // Per-chunk cache of generated table outputs, mirroring the
+                // serial checker's cross-inventory cache.
+                let mut outputs_cache: BTreeMap<(LutTable, usize), Vec<Vec<F>>> = BTreeMap::new();
+                for (li, lookup) in lookups.iter().enumerate() {
+                    let table_position = counts.table_position(lookup.table);
+                    let chunk_counts = &mut counts.counts[table_position];
+                    for row in row_lo..row_hi {
+                        let err = |e: String| format!("{ctx} lookup {li} ({:?}) row {row}: {e}", lookup.table);
+                        let mult = lookup.filter.eval_table(trace, row, public_inputs).to_canonical_u64();
+                        if mult == 0 {
+                            continue;
+                        }
+                        if mult > 1 << 20 {
+                            return Err(err(format!("implausible filter/multiplicity value {mult}")));
+                        }
+                        let keys: Vec<u64> = lookup
+                            .keys
+                            .iter()
+                            .map(|c| c.eval_table(trace, row, public_inputs).to_canonical_u64())
+                            .collect();
+                        let values: Vec<u64> = lookup
+                            .values
+                            .iter()
+                            .map(|c| c.eval_table(trace, row, public_inputs).to_canonical_u64())
+                            .collect();
+                        let (slot, table_row) = LutMultiplicities::resolve(lookup.table, &keys, &values).map_err(err)?;
+                        // Value checks need the generated table outputs; the
+                        // generator is deterministic per (table, slot), so
+                        // each chunk materializes its own cached copy.
+                        let outputs = outputs_cache
+                            .entry((lookup.table, slot))
+                            .or_insert_with(|| generate::<F>(lookup.table, slot));
+                        // BYTES2/PAIR128 bind only their key tuple, already checked by resolution.
+                        let expected_arity = match lookup.table {
+                            LutTable::Bytes2 | LutTable::Pair128 => 0,
+                            _ => outputs.len(),
+                        };
+                        if values.len() != expected_arity {
+                            return Err(err(format!("binds {} values, table returns {expected_arity}", values.len())));
+                        }
+                        for (i, &got) in values.iter().enumerate() {
+                            let want = outputs[i][table_row].to_canonical_u64();
+                            if got != want {
+                                return Err(err(format!(
+                                    "value {i} = {got:?} differs from {want:?} (slot {slot}, table row {table_row})"
+                                )));
+                            }
+                        }
+                        chunk_counts[slot][table_row] += mult;
                     }
                 }
-                counts[slot][table_row] += mult;
+                Ok(counts)
+            })
+            .collect();
+
+        // Merge in row order; surface the first error exactly as the serial walk would.
+        let mut first_err = None;
+        let mut merged = LutMultiplicities::new(&tables);
+        for res in chunk_results {
+            match res {
+                Ok(counts) => merged.merge_from(counts),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
             }
         }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        // Fold the merged chunk counters into the checker's public state.
+        self.multiplicities.merge_from(merged);
         Ok(())
     }
 }

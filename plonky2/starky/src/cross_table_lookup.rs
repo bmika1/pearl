@@ -361,11 +361,18 @@ pub(crate) fn cross_table_lookup_data<'a, F: RichField, const D: usize, const N:
 
     // Pass 1: evaluate each group's columns and filters once. Groups are
     // numbered in (ctl, side, table) order, matching pass 2's enumeration.
+    // The (table, instance) descriptors are collected first so the expensive
+    // evaluations can run in parallel across groups.
+    struct GroupDesc<'a, F: Field> {
+        table: TableIdx,
+        columns: Vec<&'a [Column<F>]>,
+        filters: Vec<&'a Filter<F>>,
+    }
     struct GroupEvals<F: Field> {
         columns: Vec<Vec<Vec<F>>>, // per instance: per column element: rows
         filters: Vec<Vec<F>>,      // per instance: rows
     }
-    let mut group_evals: Vec<GroupEvals<F>> = Vec::new();
+    let mut group_descs: Vec<GroupDesc<'a, F>> = Vec::new();
     // Per CTL: the id of its first group.
     let mut ctl_first_group: Vec<usize> = Vec::new();
 
@@ -375,31 +382,47 @@ pub(crate) fn cross_table_lookup_data<'a, F: RichField, const D: usize, const N:
             looked_tables,
         } = ctl;
         log::debug!("Processing CTL for {:?}", looked_tables[0].table);
-        ctl_first_group.push(group_evals.len());
+        ctl_first_group.push(group_descs.len());
         for tables in [looking_tables, looked_tables] {
             // Group this side's instances by trace: each group shares
             // helper columns and one Z polynomial.
             for (table, group) in &tables.iter().group_by(|twc| twc.table) {
                 let group: Vec<&TableWithColumns<F>> = group.collect();
-                let trace = &trace_poly_values[table];
-                let pis = &public_inputs[table];
-                let columns = group
-                    .iter()
-                    .map(|twc| {
-                        twc.columns
-                            .iter()
-                            .map(|c| c.eval_all_rows_with_inputs(trace, pis))
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
-                let filters = group
-                    .iter()
-                    .map(|twc| twc.filter.eval_all_rows_with_inputs(trace, pis))
-                    .collect::<Vec<_>>();
-                group_evals.push(GroupEvals { columns, filters });
+                group_descs.push(GroupDesc {
+                    table,
+                    columns: group.iter().map(|twc| &twc.columns[..]).collect(),
+                    filters: group.iter().map(|twc| &twc.filter).collect(),
+                });
             }
         }
     }
+
+    // Evaluate the groups in parallel; each group's columns and filters are
+    // independent of every other group's. Within a group, the instances'
+    // evaluations are independent too, so big groups (many instances over a
+    // 2^21-row trace) also spread across the pool.
+    let group_evals: Vec<GroupEvals<F>> = group_descs
+        .into_par_iter()
+        .map(|desc| {
+            let trace = &trace_poly_values[desc.table];
+            let pis = &public_inputs[desc.table];
+            let columns = desc
+                .columns
+                .par_iter()
+                .map(|col| {
+                    col.iter()
+                        .map(|c| c.eval_all_rows_with_inputs(trace, pis))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let filters = desc
+                .filters
+                .par_iter()
+                .map(|f| f.eval_all_rows_with_inputs(trace, pis))
+                .collect::<Vec<_>>();
+            GroupEvals { columns, filters }
+        })
+        .collect();
 
     // Pass 2: enumerate works in the exact serial order, pairing each with
     // its group's shared evaluations.
