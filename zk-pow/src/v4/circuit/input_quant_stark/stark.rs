@@ -279,80 +279,118 @@ impl InputQuantProgram {
         let zero_scales = vec![0u16; k / BLOCK_SIZE];
         let zero_noise = vec![0u16; k];
 
-        let mut rows: Vec<[F; NUM_INPUT_QUANT_COLUMNS]> = Vec::with_capacity(num_rows);
-        let mut start = 0;
-        while start < num_rows {
-            let g = start / k;
-            let len = k.min(num_rows - start);
-            let blocks = k / BLOCK_SIZE;
-            let (a_live, b_live) = (g < h, g < w);
-            let side_a = if a_live {
-                SideWitness::build(
-                    self,
-                    &a_int8[g * k..(g + 1) * k],
-                    &a_scales[g * blocks..(g + 1) * blocks],
-                    &a_noise[g * k..(g + 1) * k],
-                    true,
-                )
-            } else {
-                SideWitness::build(
-                    self,
-                    &zero_int8[..len],
-                    &zero_scales[..len / BLOCK_SIZE],
-                    &zero_noise[..len],
-                    false,
-                )
-            };
-            let side_b = if b_live {
-                SideWitness::build(
-                    self,
-                    &b_int8[g * k..(g + 1) * k],
-                    &b_scales[g * blocks..(g + 1) * blocks],
-                    &b_noise[g * k..(g + 1) * k],
-                    true,
-                )
-            } else {
-                SideWitness::build(
-                    self,
-                    &zero_int8[..len],
-                    &zero_scales[..len / BLOCK_SIZE],
-                    &zero_noise[..len],
-                    false,
-                )
-            };
-            for j in 0..len {
-                let mut row = InputQuantColumnsView::<F>::default();
-                let element_index = start + j;
-                row.is_group_final = F::from_bool(j == len - 1);
-                row.element_index = F::from_canonical_usize(element_index);
-                row.is_even_row = F::from_bool(element_index % 2 == 0);
-                row.is_block_start = F::from_bool(element_index % BLOCK_SIZE == 0);
-                row.block_index = F::from_canonical_usize(element_index / BLOCK_SIZE);
-                row.a_live = F::from_bool(a_live);
-                row.b_live = F::from_bool(b_live);
-                // Group-G counters and inverse witnesses for the schedule flags.
-                row.group_counter = F::from_canonical_usize(j);
-                row.group_final_inv = (row.group_counter - F::from_canonical_usize(k - 1))
+        // Groups are independent: one parallel job per group fills its chunk of rows. The
+        // per-row inverse witnesses take few distinct values each — the block and group
+        // finals as tiny tables, the flip witnesses via one Montgomery batch inversion
+        // per group (3 field mults per element instead of a full inversion each).
+        let group_final_inv: Vec<F> = (0..k)
+            .map(|j| {
+                (F::from_canonical_usize(j) - F::from_canonical_usize(k - 1))
                     .try_inverse()
-                    .unwrap_or(F::ZERO);
-                row.block8_counter = F::from_canonical_usize(element_index % BLOCK_SIZE);
-                row.block8_counter_inv = (row.block8_counter - F::from_canonical_usize(BLOCK_SIZE - 1))
-                    .try_inverse()
-                    .unwrap_or(F::ZERO);
-                row.a_flip_inv = (row.element_index - F::from_canonical_usize(h * k))
-                    .try_inverse()
-                    .unwrap_or(F::ZERO);
-                row.b_flip_inv = (row.element_index - F::from_canonical_usize(w * k))
-                    .try_inverse()
-                    .unwrap_or(F::ZERO);
-                side_a.fill_a(&mut row, j);
-                side_b.fill_b(&mut row, j);
-                // Pack the noise decodes for the verifier-known columns.
-                row.noise_code_a = bf16_code_of(&row.noise_a);
-                row.noise_code_b = bf16_code_of(&row.noise_b);
-                rows.push(row.into());
-            }
-            start += len;
+                    .unwrap_or(F::ZERO)
+            })
+            .collect();
+        let block8_inv: [F; BLOCK_SIZE] = std::array::from_fn(|b| {
+            (F::from_canonical_usize(b) - F::from_canonical_usize(BLOCK_SIZE - 1))
+                .try_inverse()
+                .unwrap_or(F::ZERO)
+        });
+        let mut rows: Vec<[F; NUM_INPUT_QUANT_COLUMNS]> = vec![[F::ZERO; NUM_INPUT_QUANT_COLUMNS]; num_rows];
+        {
+            // Group `g` starts at `g*k` (the trailing group may be shorter than `k`).
+            use plonky2_maybe_rayon::{IndexedParallelIterator, MaybeParChunksMut, ParallelIterator};
+            rows.par_chunks_mut(k).enumerate().for_each(|(g, chunk)| {
+                let start = g * k;
+                let len = chunk.len();
+                let blocks = k / BLOCK_SIZE;
+                let (a_live, b_live) = (g < h, g < w);
+                let side_a = if a_live {
+                    SideWitness::build(
+                        self,
+                        &a_int8[g * k..(g + 1) * k],
+                        &a_scales[g * blocks..(g + 1) * blocks],
+                        &a_noise[g * k..(g + 1) * k],
+                        true,
+                    )
+                } else {
+                    SideWitness::build(
+                        self,
+                        &zero_int8[..len],
+                        &zero_scales[..len / BLOCK_SIZE],
+                        &zero_noise[..len],
+                        false,
+                    )
+                };
+                let side_b = if b_live {
+                    SideWitness::build(
+                        self,
+                        &b_int8[g * k..(g + 1) * k],
+                        &b_scales[g * blocks..(g + 1) * blocks],
+                        &b_noise[g * k..(g + 1) * k],
+                        true,
+                    )
+                } else {
+                    SideWitness::build(
+                        self,
+                        &zero_int8[..len],
+                        &zero_scales[..len / BLOCK_SIZE],
+                        &zero_noise[..len],
+                        false,
+                    )
+                };
+                // Montgomery batch inversion of the A/B flip witnesses over this group's
+                // element indices — one field inversion total per group and side.
+                let flips: Vec<(F, F)> = {
+                    let batch_invert = |limit: usize| -> Vec<F> {
+                        let mut prods = Vec::with_capacity(len);
+                        let mut prod = F::ONE;
+                        for j in 0..len {
+                            prods.push(prod);
+                            let d = F::from_canonical_usize(start + j) - F::from_canonical_usize(limit);
+                            if d != F::ZERO {
+                                prod *= d;
+                            }
+                        }
+                        let mut inv = prod.try_inverse().unwrap_or(F::ONE);
+                        let mut invs = vec![F::ZERO; len];
+                        for j in (0..len).rev() {
+                            let d = F::from_canonical_usize(start + j) - F::from_canonical_usize(limit);
+                            if d != F::ZERO {
+                                invs[j] = inv * prods[j];
+                                inv *= d;
+                            }
+                        }
+                        invs
+                    };
+                    let (invs_a, invs_b) = (batch_invert(h * k), batch_invert(w * k));
+                    invs_a.into_iter().zip(invs_b).collect()
+                };
+                for (j, row_slot) in chunk.iter_mut().enumerate() {
+                    let mut row = InputQuantColumnsView::<F>::default();
+                    let element_index = start + j;
+                    row.is_group_final = F::from_bool(j == len - 1);
+                    row.element_index = F::from_canonical_usize(element_index);
+                    row.is_even_row = F::from_bool(element_index % 2 == 0);
+                    row.is_block_start = F::from_bool(element_index % BLOCK_SIZE == 0);
+                    row.block_index = F::from_canonical_usize(element_index / BLOCK_SIZE);
+                    row.a_live = F::from_bool(a_live);
+                    row.b_live = F::from_bool(b_live);
+                    // Group-G counters and inverse witnesses for the schedule flags.
+                    row.group_counter = F::from_canonical_usize(j);
+                    row.group_final_inv = group_final_inv[j];
+                    row.block8_counter = F::from_canonical_usize(element_index % BLOCK_SIZE);
+                    row.block8_counter_inv = block8_inv[element_index % BLOCK_SIZE];
+                    let (a_flip_inv, b_flip_inv) = flips[j];
+                    row.a_flip_inv = a_flip_inv;
+                    row.b_flip_inv = b_flip_inv;
+                    side_a.fill_a(&mut row, j);
+                    side_b.fill_b(&mut row, j);
+                    // Pack the noise decodes for the verifier-known columns.
+                    row.noise_code_a = bf16_code_of(&row.noise_a);
+                    row.noise_code_b = bf16_code_of(&row.noise_b);
+                    *row_slot = row.into();
+                }
+            });
         }
         blind_trace(&mut rows);
         (rows, self.public_inputs())
