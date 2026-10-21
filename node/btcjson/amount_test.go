@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/pearl-research-labs/pearl/node/btcjson"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestAmountJSON(t *testing.T) {
@@ -37,19 +39,11 @@ func TestAmountJSON(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.json, func(t *testing.T) {
 			encoded, err := json.Marshal(test.amount)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(encoded) != test.json {
-				t.Fatalf("got %s, want %s", encoded, test.json)
-			}
+			require.NoError(t, err)
+			assert.Equal(t, test.json, string(encoded))
 			var decoded btcjson.Amount
-			if err := json.Unmarshal(encoded, &decoded); err != nil {
-				t.Fatal(err)
-			}
-			if decoded != test.amount {
-				t.Fatalf("got %d grains, want %d", decoded, test.amount)
-			}
+			require.NoError(t, json.Unmarshal(encoded, &decoded))
+			assert.Equal(t, test.amount, decoded)
 		})
 	}
 }
@@ -82,13 +76,8 @@ func TestAmountUnmarshalJSON(t *testing.T) {
 	}
 	for _, test := range tests {
 		var got btcjson.Amount
-		if err := json.Unmarshal([]byte(test.json), &got); err != nil {
-			t.Errorf("Unmarshal %.80q: %v", test.json, err)
-			continue
-		}
-		if got != test.want {
-			t.Errorf("Unmarshal %.80q = %d grains, want %d", test.json, got, test.want)
-		}
+		require.NoError(t, json.Unmarshal([]byte(test.json), &got), "Unmarshal %.80q", test.json)
+		assert.Equal(t, test.want, got, "Unmarshal %.80q", test.json)
 	}
 }
 
@@ -104,12 +93,8 @@ func TestAmountUnmarshalJSONErrors(t *testing.T) {
 		"1e" + strings.Repeat("9", 4096), "1e-" + strings.Repeat("9", 4096),
 	} {
 		got := btcjson.Amount(123)
-		if err := got.UnmarshalJSON([]byte(number)); err == nil {
-			t.Errorf("Unmarshal %.80q unexpectedly succeeded", number)
-		}
-		if got != 123 {
-			t.Errorf("Unmarshal %.80q changed receiver on error to %d", number, got)
-		}
+		assert.Error(t, got.UnmarshalJSON([]byte(number)), "Unmarshal %.80q", number)
+		assert.Equal(t, btcjson.Amount(123), got, "Unmarshal %.80q changed receiver on error", number)
 	}
 }
 
@@ -123,19 +108,11 @@ func TestAmountResultRoundTrip(t *testing.T) {
 		btcjson.GetTxOutResult{Value: amount},
 	} {
 		encoded, err := json.Marshal(result)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !strings.Contains(string(encoded), `"value":67108864.00000002`) {
-			t.Errorf("%T has inexact JSON: %s", result, encoded)
-		}
+		require.NoError(t, err)
+		assert.Contains(t, string(encoded), `"value":67108864.00000002`, "%T has inexact JSON", result)
 		decoded := reflect.New(reflect.TypeOf(result))
-		if err := json.Unmarshal(encoded, decoded.Interface()); err != nil {
-			t.Fatal(err)
-		}
-		if !reflect.DeepEqual(decoded.Elem().Interface(), result) {
-			t.Errorf("%T changed after JSON round trip", result)
-		}
+		require.NoError(t, json.Unmarshal(encoded, decoded.Interface()))
+		assert.Equal(t, result, decoded.Elem().Interface(), "%T changed after JSON round trip", result)
 	}
 }
 
@@ -145,67 +122,52 @@ func TestAmountNotificationRoundTrip(t *testing.T) {
 	const amount btcjson.Amount = 6710886400000002
 	for _, arg := range []interface{}{amount, "67108864.00000002", "6.710886400000002e7"} {
 		command, err := btcjson.NewCmd("txaccepted", "123", arg)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !reflect.DeepEqual(command, btcjson.NewTxAcceptedNtfn("123", amount)) {
-			t.Fatalf("NewCmd(%v) = %#v", arg, command)
-		}
+		require.NoError(t, err)
+		assert.Equal(t, btcjson.NewTxAcceptedNtfn("123", amount), command, "NewCmd(%v)", arg)
 		encoded, err := btcjson.MarshalCmd(btcjson.RpcVersion1, nil, command)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 		var request btcjson.Request
-		if err := json.Unmarshal(encoded, &request); err != nil {
-			t.Fatal(err)
-		}
-		if string(request.Params[1]) != "67108864.00000002" {
-			t.Fatalf("request rounded amount: %s", request.Params[1])
-		}
+		require.NoError(t, json.Unmarshal(encoded, &request))
+		require.Len(t, request.Params, 2)
+		assert.Equal(t, "67108864.00000002", string(request.Params[1]), "request rounded amount")
 		decoded, err := btcjson.UnmarshalCmd(&request)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !reflect.DeepEqual(decoded, command) {
-			t.Fatalf("notification round trip = %#v, want %#v", decoded, command)
-		}
+		require.NoError(t, err)
+		assert.Equal(t, command, decoded, "notification round trip")
 	}
 	for _, arg := range []interface{}{1.25, "1e-9", `"1.25"`} {
-		if _, err := btcjson.NewCmd("txaccepted", "123", arg); err == nil {
-			t.Errorf("NewCmd unexpectedly accepted %v (%T)", arg, arg)
-		}
+		_, err := btcjson.NewCmd("txaccepted", "123", arg)
+		assert.Error(t, err, "NewCmd unexpectedly accepted %v (%T)", arg, arg)
 	}
 }
 
 func TestRequestPreservesParameterJSON(t *testing.T) {
 	t.Parallel()
 
-	input := `{"jsonrpc":"1.0","method":"test","params":[67108864.00000002,1e-8,{"amount":9007199254740993},null,true,"text"],"id":1}`
+	input := `{
+		"jsonrpc":"1.0",
+		"method":"test",
+		"params":[67108864.00000002,1e-8,{"amount":9007199254740993},null,true,"text"],
+		"id":1
+	}`
 	var request btcjson.Request
-	if err := json.Unmarshal([]byte(input), &request); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, json.Unmarshal([]byte(input), &request))
 	want := []string{"67108864.00000002", "1e-8", `{"amount":9007199254740993}`, "null", "true", `"text"`}
-	if len(request.Params) != len(want) {
-		t.Fatalf("got %d params, want %d", len(request.Params), len(want))
-	}
+	require.Len(t, request.Params, len(want))
 	for i, param := range request.Params {
-		if string(param) != want[i] {
-			t.Errorf("param %d = %s, want %s", i, param, want[i])
-		}
+		assert.Equal(t, want[i], string(param), "param %d", i)
 	}
-	for _, input := range []string{`{"method":"test"}`, `{"method":"test","params":null}`, `{"method":"test","params":[]}`} {
-		if err := json.Unmarshal([]byte(input), &request); err != nil {
-			t.Fatal(err)
-		}
-		if request.Params == nil || len(request.Params) != 0 {
-			t.Errorf("missing or null params should decode to an empty array: %s", input)
-		}
+	for _, input := range []string{
+		`{"method":"test"}`,
+		`{"method":"test","params":null}`,
+		`{"method":"test","params":[]}`,
+	} {
+		require.NoError(t, json.Unmarshal([]byte(input), &request))
+		assert.NotNil(t, request.Params, "missing or null params should decode to an empty array: %s", input)
+		assert.Empty(t, request.Params, "missing or null params should decode to an empty array: %s", input)
 	}
 	for _, input := range []string{"null", `{"params":{}}`, `{"params":1}`, `{"params":"x"}`} {
-		if err := json.Unmarshal([]byte(input), &request); err == nil {
-			t.Errorf("invalid request unexpectedly accepted: %s", input)
-		}
+		assert.Error(t, json.Unmarshal([]byte(input), &request),
+			"invalid request unexpectedly accepted: %s", input)
 	}
 }
 
@@ -215,13 +177,11 @@ func TestAmountHelp(t *testing.T) {
 	examples, complex := btcjson.TstReflectTypeToJSONExample(func(key string) string {
 		return key
 	}, reflect.TypeOf(btcjson.Amount(0)), 0, "amount")
-	if complex || !reflect.DeepEqual(examples, []string{"n.nnn"}) {
-		t.Fatalf("amount JSON example = %v, complex=%v", examples, complex)
-	}
+	assert.False(t, complex)
+	assert.Equal(t, []string{"n.nnn"}, examples)
 	field := reflect.TypeOf(struct{ Vout btcjson.Vout }{}).Field(0)
-	if usage := btcjson.TstFieldUsage(field, nil); !strings.Contains(usage, `"value":n.nnn`) {
-		t.Fatalf("amount usage should show a decimal number: %s", usage)
-	}
+	assert.Contains(t, btcjson.TstFieldUsage(field, nil), `"value":n.nnn`,
+		"amount usage should show a decimal number")
 }
 
 func FuzzAmountRoundTrip(f *testing.F) {
@@ -230,15 +190,9 @@ func FuzzAmountRoundTrip(f *testing.F) {
 	}
 	f.Fuzz(func(t *testing.T, grains int64) {
 		encoded, err := json.Marshal(btcjson.Amount(grains))
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 		var decoded btcjson.Amount
-		if err := json.Unmarshal(encoded, &decoded); err != nil {
-			t.Fatal(err)
-		}
-		if int64(decoded) != grains {
-			t.Fatalf("%d grains became %d through %s", grains, decoded, encoded)
-		}
+		require.NoError(t, json.Unmarshal(encoded, &decoded))
+		assert.Equal(t, grains, int64(decoded), "round trip through %s", encoded)
 	})
 }

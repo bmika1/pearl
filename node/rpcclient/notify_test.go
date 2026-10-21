@@ -7,6 +7,8 @@ import (
 	"github.com/pearl-research-labs/pearl/node/btcjson"
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestTxAcceptedNotificationAmounts exercises the actual message dispatch path
@@ -36,34 +38,35 @@ func TestTxAcceptedNotificationAmounts(t *testing.T) {
 					var gotAmount btcutil.Amount
 					client := &Client{ntfnHandlers: &NotificationHandlers{
 						OnTxAccepted: func(hash *chainhash.Hash, amount btcutil.Amount) {
-							if verbose {
-								t.Fatal("called nonverbose handler for verbose notification")
-							}
+							require.False(t, verbose)
 							calls++
 							gotHash, gotAmount = hash.String(), amount
 						},
 						OnTxAcceptedVerbose: func(tx *btcjson.TxRawResult) {
-							if !verbose {
-								t.Fatal("called verbose handler for nonverbose notification")
-							}
-							if len(tx.Vout) != 1 {
-								t.Fatalf("got %d outputs, want 1", len(tx.Vout))
-							}
+							require.True(t, verbose)
+							require.Len(t, tx.Vout, 1)
 							calls++
 							gotHash, gotAmount = tx.Txid, btcutil.Amount(tx.Vout[0].Value)
 						},
 					}}
 					var message string
 					if verbose {
-						message = fmt.Sprintf(`{"jsonrpc":"1.0","id":null,"method":"txacceptedverbose","params":[{"txid":%q,"vout":[{"value":%s}]}]}`, txID, test.value)
+						message = fmt.Sprintf(
+							`{"jsonrpc":"1.0","id":null,"method":"txacceptedverbose",`+
+								`"params":[{"txid":%q,"vout":[{"value":%s}]}]}`,
+							txID, test.value,
+						)
 					} else {
-						message = fmt.Sprintf(`{"jsonrpc":"1.0","id":null,"method":"txaccepted","params":[%q,%s]}`, txID, test.value)
+						message = fmt.Sprintf(
+							`{"jsonrpc":"1.0","id":null,"method":"txaccepted",`+
+								`"params":[%q,%s]}`,
+							txID, test.value,
+						)
 					}
 					client.handleMessage([]byte(message))
-					if calls != 1 || gotHash != txID || gotAmount != test.grains {
-						t.Fatalf("got calls=%d hash=%s grains=%d; want calls=1 hash=%s grains=%d",
-							calls, gotHash, int64(gotAmount), txID, int64(test.grains))
-					}
+					assert.Equal(t, 1, calls)
+					assert.Equal(t, txID, gotHash)
+					assert.Equal(t, test.grains, gotAmount)
 				})
 			}
 		})
@@ -79,16 +82,19 @@ func TestTxAcceptedNotificationInvalidAmounts(t *testing.T) {
 		t.Run(value, func(t *testing.T) {
 			client := &Client{ntfnHandlers: &NotificationHandlers{
 				OnTxAccepted: func(*chainhash.Hash, btcutil.Amount) {
-					t.Error("invalid amount reached nonverbose callback")
+					assert.Fail(t, "invalid amount reached nonverbose callback")
 				},
 				OnTxAcceptedVerbose: func(*btcjson.TxRawResult) {
-					t.Error("invalid amount reached verbose callback")
+					assert.Fail(t, "invalid amount reached verbose callback")
 				},
 			}}
 			client.handleMessage([]byte(fmt.Sprintf(
 				`{"id":null,"method":"txaccepted","params":[%q,%s]}`, txID, value)))
 			client.handleMessage([]byte(fmt.Sprintf(
-				`{"id":null,"method":"txacceptedverbose","params":[{"txid":%q,"vout":[{"value":%s}]}]}`, txID, value)))
+				`{"id":null,"method":"txacceptedverbose",`+
+					`"params":[{"txid":%q,"vout":[{"value":%s}]}]}`,
+				txID, value,
+			)))
 		})
 	}
 }

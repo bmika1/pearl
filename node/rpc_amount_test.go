@@ -134,7 +134,7 @@ func TestRPCTransactionAmountPrecision(t *testing.T) {
 						require.Len(t, notification.Params, 1)
 						requireExactRPCOutput(t, notification.Params[0], tc.grain)
 					default:
-						t.Fatal("verbose transaction notification was not queued")
+						require.FailNow(t, "verbose transaction notification was not queued")
 					}
 				}
 			})
