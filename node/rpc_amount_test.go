@@ -6,12 +6,17 @@ package main
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"math"
+	"math/big"
 	"testing"
 
 	"github.com/pearl-research-labs/pearl/node/btcjson"
 	"github.com/pearl-research-labs/pearl/node/btcutil"
+	"github.com/pearl-research-labs/pearl/node/chaincfg"
+	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
+	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,18 +55,6 @@ func TestRPCAmountMarshalJSON(t *testing.T) {
 			require.True(t, json.Valid(encoded))
 		})
 	}
-}
-
-// Compare decoded JSON so fixed decimal formatting and field order may differ,
-// while field names, omission rules, nulls, arrays, and values must stay intact.
-func requireRPCAmountJSONShape(t *testing.T, legacy, exact interface{}) []byte {
-	t.Helper()
-	legacyJSON, err := json.Marshal(legacy)
-	require.NoError(t, err)
-	exactJSON, err := json.Marshal(exact)
-	require.NoError(t, err)
-	require.JSONEq(t, string(legacyJSON), string(exactJSON))
-	return exactJSON
 }
 
 func TestRPCAmountResultJSONCompatibility(t *testing.T) {
@@ -216,4 +209,168 @@ func TestRPCVinPrevOutJSONCompatibility(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRPCTransactionAmountPrecision(t *testing.T) {
+	t.Parallel()
+
+	const reported int64 = 6710886400000002
+	cases := []struct {
+		name  string
+		grain int64
+	}{
+		{"zero", 0},
+		{"one_grain", 1},
+		{"reported_minus_one", reported - 1},
+		{"reported", reported},
+		{"reported_plus_one", reported + 1},
+		{"above_integer_float_limit", 9007199254740993},
+		{"consensus_max_minus_one", btcutil.MaxGrain - 1},
+		{"consensus_max", btcutil.MaxGrain},
+		// decoderawtransaction parses signed wire amounts without applying
+		// consensus checks, so formatting must also handle these edge cases.
+		{"negative_one_grain", -1},
+		{"negative_fraction", -100000001},
+		{"negative_reported", -reported},
+		{"int64_min", math.MinInt64},
+		{"int64_max", math.MaxInt64},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			tx := wire.NewMsgTx(wire.TxVersion)
+			outpoint := wire.OutPoint{Hash: chainhash.Hash{1}, Index: 0}
+			tx.AddTxIn(wire.NewTxIn(&outpoint, nil, nil))
+			script := append([]byte{0x51, 0x20}, bytes.Repeat([]byte{0x01}, 32)...)
+			tx.AddTxOut(wire.NewTxOut(tc.grain, script))
+
+			var serialized bytes.Buffer
+			require.NoError(t, tx.Serialize(&serialized))
+			rawHex := hex.EncodeToString(serialized.Bytes())
+			var decoded wire.MsgTx
+			require.NoError(t, decoded.Deserialize(bytes.NewReader(serialized.Bytes())))
+			require.Equal(t, tc.grain, decoded.TxOut[0].Value)
+
+			t.Run("decoderawtransaction", func(t *testing.T) {
+				requestJSON, err := btcjson.MarshalCmd(btcjson.RpcVersion1, 1,
+					btcjson.NewDecodeRawTransactionCmd(rawHex))
+				require.NoError(t, err)
+				var request btcjson.Request
+				require.NoError(t, json.Unmarshal(requestJSON, &request))
+				server := rpcServer{cfg: rpcserverConfig{ChainParams: &chaincfg.MainNetParams}}
+				response := server.processRequest(&request, true, make(chan struct{}))
+				requireExactRPCOutput(t, rpcPrecisionResponseResult(t, response), tc.grain)
+			})
+
+			// The shared constructor supplies verbose getrawtransaction and
+			// getblock results, and verbose transaction notifications.
+			result, err := createTxRawResult(&chaincfg.MainNetParams, tx,
+				tx.TxHash().String(), nil, "", 0, 0)
+			require.NoError(t, err)
+			require.Equal(t, rawHex, result.Hex)
+
+			t.Run("getrawtransaction", func(t *testing.T) {
+				encoded, err := btcjson.MarshalResponse(btcjson.RpcVersion1, 1, result, nil)
+				require.NoError(t, err)
+				requireExactRPCOutput(t, rpcPrecisionResponseResult(t, encoded), tc.grain)
+			})
+
+			t.Run("verbose_block_envelope", func(t *testing.T) {
+				block := rpcGetBlockVerboseResult{RawTx: []rpcTxRawResult{*result}}
+				encoded, err := btcjson.MarshalResponse(btcjson.RpcVersion1, 1, block, nil)
+				require.NoError(t, err)
+				var response struct {
+					RawTx []json.RawMessage `json:"rawtx"`
+				}
+				require.NoError(t, json.Unmarshal(rpcPrecisionResponseResult(t, encoded), &response))
+				require.Len(t, response.RawTx, 1)
+				requireExactRPCOutput(t, response.RawTx[0], tc.grain)
+			})
+
+			t.Run("search_transactions_envelope", func(t *testing.T) {
+				search := []rpcSearchRawTransactionsResult{{Vout: result.Vout}}
+				encoded, err := btcjson.MarshalResponse(btcjson.RpcVersion1, 1, search, nil)
+				require.NoError(t, err)
+				var response []json.RawMessage
+				require.NoError(t, json.Unmarshal(rpcPrecisionResponseResult(t, encoded), &response))
+				require.Len(t, response, 1)
+				requireExactRPCOutput(t, response[0], tc.grain)
+			})
+
+			t.Run("verbose_websocket_notification", func(t *testing.T) {
+				manager := wsNotificationManager{
+					server: &rpcServer{cfg: rpcserverConfig{ChainParams: &chaincfg.MainNetParams}},
+				}
+				clients := make(map[chan struct{}]*wsClient)
+				for i := 0; i < 2; i++ {
+					quit := make(chan struct{})
+					clients[quit] = &wsClient{
+						verboseTxUpdates: true,
+						ntfnChan:         make(chan []byte, 1),
+						quit:             quit,
+					}
+				}
+				manager.notifyForNewTx(clients, btcutil.NewTx(tx))
+				for _, client := range clients {
+					select {
+					case encoded := <-client.ntfnChan:
+						// Keep parameters as raw JSON. btcjson.Request's custom
+						// unmarshaler decodes through float64 internally.
+						var notification struct {
+							Method string            `json:"method"`
+							Params []json.RawMessage `json:"params"`
+						}
+						require.NoError(t, json.Unmarshal(encoded, &notification))
+						require.Equal(t, "txacceptedverbose", notification.Method)
+						require.Len(t, notification.Params, 1)
+						requireExactRPCOutput(t, notification.Params[0], tc.grain)
+					default:
+						t.Fatal("verbose transaction notification was not queued")
+					}
+				}
+			})
+		})
+	}
+}
+
+// Compare decoded JSON so fixed decimal formatting and field order may differ,
+// while field names, omission rules, nulls, arrays, and values must stay intact.
+func requireRPCAmountJSONShape(t *testing.T, legacy, exact interface{}) []byte {
+	t.Helper()
+	legacyJSON, err := json.Marshal(legacy)
+	require.NoError(t, err)
+	exactJSON, err := json.Marshal(exact)
+	require.NoError(t, err)
+	require.JSONEq(t, string(legacyJSON), string(exactJSON))
+	return exactJSON
+}
+
+// requireExactRPCOutput checks the JSON number itself, without first decoding it
+// into a float. Exact decimal clients must recover every grain from this token.
+func requireExactRPCOutput(t *testing.T, encoded json.RawMessage, grain int64) {
+	t.Helper()
+
+	var tx struct {
+		Vout []struct {
+			Value json.RawMessage `json:"value"`
+		} `json:"vout"`
+	}
+	require.NoError(t, json.Unmarshal(encoded, &tx))
+	require.Len(t, tx.Vout, 1)
+	token := string(tx.Vout[0].Value)
+	recovered, ok := new(big.Rat).SetString(token)
+	require.Truef(t, ok, "value must be a JSON number, got %q", token)
+	recovered.Mul(recovered, big.NewRat(btcutil.GrainPerPearl, 1))
+	require.Equalf(t, 0, recovered.Cmp(new(big.Rat).SetInt64(grain)),
+		"JSON %s recovers %s grain, want %d", token, recovered.RatString(), grain)
+}
+
+func rpcPrecisionResponseResult(t *testing.T, encoded []byte) json.RawMessage {
+	t.Helper()
+
+	var response btcjson.Response
+	require.NoError(t, json.Unmarshal(encoded, &response))
+	require.Nil(t, response.Error)
+	return response.Result
 }
