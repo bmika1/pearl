@@ -25,6 +25,7 @@ use plonky2::plonk::plonk_common::{
     reduce_with_powers, reduce_with_powers_circuit, reduce_with_powers_ext_circuit,
 };
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
+use plonky2_maybe_rayon::*;
 
 use crate::constraint_consumer::{ConstraintConsumer, RecursiveConstraintConsumer};
 use crate::evaluation_frame::StarkEvaluationFrame;
@@ -569,6 +570,9 @@ impl<F: Field> Column<F> {
         public_inputs: &[F],
     ) -> Vec<F> {
         let num_rows = table[0].len();
+        if crate::poc_par::par_eval() && num_rows >= 65_536 {
+            return self.eval_all_rows_par(table, public_inputs, num_rows);
+        }
 
         // Row-independent part: the constant plus the public-input offsets.
         let constant = self
@@ -602,6 +606,56 @@ impl<F: Field> Column<F> {
         }
 
         result
+    }
+
+    /// Row-chunked `eval_all_rows_with_inputs`. Each chunk adds the same terms
+    /// the serial walk would, so the field elements match.
+    fn eval_all_rows_par(
+        &self,
+        table: &[PolynomialValues<F>],
+        public_inputs: &[F],
+        num_rows: usize,
+    ) -> Vec<F> {
+        let constant = self
+            .public_input_offsets
+            .iter()
+            .map(|&s| public_inputs[s])
+            .sum::<F>()
+            + self.constant;
+        let scaled = self
+            .public_input_scaled
+            .iter()
+            .map(|&(c, s)| (c, public_inputs[s]));
+        let terms: Vec<(usize, F)> = self
+            .linear_combination
+            .iter()
+            .copied()
+            .chain(scaled)
+            .collect();
+        let chunk = 65_536;
+        let parts: Vec<Vec<F>> = (0..num_rows)
+            .step_by(chunk)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|start| {
+                let end = (start + chunk).min(num_rows);
+                let mut result = vec![constant; end - start];
+                for &(col_idx, factor) in &terms {
+                    let col_values = &table[col_idx].values;
+                    for (i, r) in result.iter_mut().enumerate() {
+                        *r += col_values[start + i] * factor;
+                    }
+                }
+                for &(col_idx, factor) in &self.next_row_linear_combination {
+                    let col_values = &table[col_idx].values;
+                    for (i, r) in result.iter_mut().enumerate() {
+                        *r += col_values[(start + i + 1) % num_rows] * factor;
+                    }
+                }
+                result
+            })
+            .collect();
+        parts.into_iter().flatten().collect()
     }
 
     /// Evaluates the column on all rows.
@@ -974,7 +1028,7 @@ pub(crate) fn lookup_helper_columns<F: Field>(
     for x in table.iter_mut() {
         *x = challenge + *x;
     }
-    let table_inverse: Vec<F> = F::batch_multiplicative_inverse(&table);
+    let table_inverse: Vec<F> = crate::poc_par::batch_inverse(&table);
 
     // Compute the `Z` polynomial with `Z(1)=0` and `Z(gx) = Z(x) + sum h_i(x) - frequencies(x)g(x)`.
     // This enforces the check from the paper, that the sum of the h_k(x) polynomials is 0 over H.
@@ -1147,43 +1201,47 @@ pub(crate) fn get_helper_cols<F: Field>(
         .len()
         .div_ceil(constraint_degree.checked_sub(1).unwrap_or(1));
 
-    let chunks = columns_filters.chunks(constraint_degree.checked_sub(1).unwrap_or(1));
-    let helper_columns: Vec<_> = chunks
-        .filter_map(|cols_filts| {
-            cols_filts
-                .iter()
-                .map(|(col, filter)| {
-                    // Optimization: for single-element columns, combine([x]) = x + gamma (no beta multiplication)
-                    let mut combined = if col.len() == 1 {
-                        let mut col_values = col[0].eval_all_rows_with_inputs(trace, public_inputs);
-                        col_values.iter_mut().for_each(|v| *v += challenge.gamma);
-                        col_values
-                    } else {
-                        // Multi-element columns: precompute all rows, combine via iterator
-                        let col_all_rows: Vec<Vec<F>> = col
-                            .iter()
-                            .map(|c| c.eval_all_rows_with_inputs(trace, public_inputs))
-                            .collect();
-                        (0..degree)
-                            .map(|d| {
-                                challenge
-                                    .combine_base(col_all_rows.iter().map(|col_vals| col_vals[d]))
-                            })
-                            .collect()
-                    };
-
-                    combined = F::batch_multiplicative_inverse(&combined);
-                    let filter_col = filter.eval_all_rows_with_inputs(trace, public_inputs);
-                    batch_multiply_inplace(&mut combined, &filter_col);
-                    combined
-                })
-                .reduce(|mut acc, combined| {
-                    batch_add_inplace(&mut acc, &combined);
-                    acc
-                })
-                .map(PolynomialValues::from)
-        })
+    let chunks: Vec<_> = columns_filters
+        .chunks(constraint_degree.checked_sub(1).unwrap_or(1))
         .collect();
+    let build_chunk = |cols_filts: &[ColumnFilter<F>]| {
+        cols_filts
+            .iter()
+            .map(|(col, filter)| {
+                // Optimization: for single-element columns, combine([x]) = x + gamma (no beta multiplication)
+                let mut combined = if col.len() == 1 {
+                    let mut col_values = col[0].eval_all_rows_with_inputs(trace, public_inputs);
+                    col_values.iter_mut().for_each(|v| *v += challenge.gamma);
+                    col_values
+                } else {
+                    // Multi-element columns: precompute all rows, combine via iterator
+                    let col_all_rows: Vec<Vec<F>> = col
+                        .iter()
+                        .map(|c| c.eval_all_rows_with_inputs(trace, public_inputs))
+                        .collect();
+                    (0..degree)
+                        .map(|d| {
+                            challenge.combine_base(col_all_rows.iter().map(|col_vals| col_vals[d]))
+                        })
+                        .collect()
+                };
+
+                combined = crate::poc_par::batch_inverse(&combined);
+                let filter_col = filter.eval_all_rows_with_inputs(trace, public_inputs);
+                batch_multiply_inplace(&mut combined, &filter_col);
+                combined
+            })
+            .reduce(|mut acc, combined| {
+                batch_add_inplace(&mut acc, &combined);
+                acc
+            })
+            .map(PolynomialValues::from)
+    };
+    let helper_columns: Vec<_> = if crate::poc_par::par_cols() && chunks.len() > 1 {
+        chunks.par_iter().copied().filter_map(build_chunk).collect()
+    } else {
+        chunks.into_iter().filter_map(build_chunk).collect()
+    };
     assert_eq!(helper_columns.len(), num_helper_columns);
 
     helper_columns

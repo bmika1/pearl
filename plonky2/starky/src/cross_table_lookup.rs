@@ -342,6 +342,7 @@ pub(crate) fn cross_table_lookup_data<'a, F: RichField, const D: usize, const N:
     ctl_challenges: &GrandProductChallengeSet<F>,
     constraint_degree: usize,
 ) -> [CtlData<'a, F>; N] {
+    crate::poc_par::stamp("ctl-start");
     // The unit of parallelizable work: one (table, side-instances) group of one side of
     // one CTL under one challenge — exactly one `partial_sums_with_evals` call.
     //
@@ -469,6 +470,7 @@ pub(crate) fn cross_table_lookup_data<'a, F: RichField, const D: usize, const N:
             filter: work.filter,
         });
     }
+    crate::poc_par::stamp("ctl-end");
     ctl_data_per_table
 }
 
@@ -516,7 +518,7 @@ fn partial_sums_with_evals<F: Field>(
                     .map(|d| challenge.combine_base(instance.iter().map(|vals| vals[d])))
                     .collect()
             };
-            combined = F::batch_multiplicative_inverse(&combined);
+            combined = crate::poc_par::batch_inverse(&combined);
             batch_multiply_inplace(&mut combined, filter);
             acc = Some(match acc {
                 None => combined,
