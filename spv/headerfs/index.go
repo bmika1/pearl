@@ -36,7 +36,22 @@ var (
 	// ErrHashNotFound is returned when a specified block hash isn't found
 	// in a target index.
 	ErrHashNotFound = fmt.Errorf("target hash not found in index")
+
+	// ErrHeaderStoreCorrupt is returned when a header file and its index
+	// disagree in a way that can't be repaired in place. The stored
+	// headers have to be discarded and synced again.
+	ErrHeaderStoreCorrupt = errors.New("header store is corrupt")
 )
+
+// corruptErr marks cause as ErrHeaderStoreCorrupt, keeping cause in the chain.
+func corruptErr(cause error) error {
+	return fmt.Errorf("%w: %w", ErrHeaderStoreCorrupt, cause)
+}
+
+// corruptErrf is corruptErr for a freshly formatted cause.
+func corruptErrf(format string, args ...interface{}) error {
+	return corruptErr(fmt.Errorf(format, args...))
+}
 
 // HeaderType is an enum-like type which defines the various header types that
 // are stored within the index.
@@ -493,4 +508,175 @@ func deleteHeaderEntries(rootBucket walletdb.ReadWriteBucket,
 	}
 
 	return nil
+}
+
+// forEachEntry calls fn for every hash and height in the index. Entries sit in
+// sub buckets or, in databases written by older versions, directly in the root
+// bucket. The hash is only valid until fn returns.
+func forEachEntry(rootBucket walletdb.ReadBucket,
+	fn func(hash []byte, height uint32) error) error {
+
+	visit := func(k, v []byte) error {
+		if len(k) != chainhash.HashSize || len(v) != 4 {
+			return nil
+		}
+
+		return fn(k, binary.BigEndian.Uint32(v))
+	}
+
+	return rootBucket.ForEach(func(k, v []byte) error {
+		if v != nil {
+			return visit(k, v)
+		}
+
+		subBucket := rootBucket.NestedReadBucket(k)
+		if subBucket == nil {
+			return nil
+		}
+
+		return subBucket.ForEach(visit)
+	})
+}
+
+// hashesAboveHeight returns the hash of every header indexed above height.
+func hashesAboveHeight(rootBucket walletdb.ReadBucket,
+	height uint32) ([]*chainhash.Hash, error) {
+
+	var hashes []*chainhash.Hash
+	err := forEachEntry(rootBucket, func(hash []byte, h uint32) error {
+		if h <= height {
+			return nil
+		}
+
+		stale, err := chainhash.NewHash(hash)
+		if err != nil {
+			return err
+		}
+		hashes = append(hashes, stale)
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return hashes, nil
+}
+
+// deleteEntriesAbove removes every header indexed above height and returns how
+// many there were.
+func deleteEntriesAbove(rootBucket walletdb.ReadWriteBucket,
+	height uint32) (int, error) {
+
+	stale, err := hashesAboveHeight(rootBucket, height)
+	if err != nil {
+		return 0, err
+	}
+
+	return len(stale), deleteHeaderEntries(rootBucket, stale)
+}
+
+// hashAtHeight returns the hash of the header indexed at height. Having more
+// than one is reported as an error, since there is no telling which is right.
+func hashAtHeight(rootBucket walletdb.ReadBucket,
+	height uint32) (*chainhash.Hash, error) {
+
+	var found *chainhash.Hash
+	err := forEachEntry(rootBucket, func(hash []byte, h uint32) error {
+		if h != height {
+			return nil
+		}
+
+		candidate, err := chainhash.NewHash(hash)
+		if err != nil {
+			return err
+		}
+		if found != nil && !found.IsEqual(candidate) {
+			return fmt.Errorf("multiple headers indexed at "+
+				"height %d", height)
+		}
+		found = candidate
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if found == nil {
+		return nil, ErrHeightNotFound
+	}
+
+	return found, nil
+}
+
+// rollbackIndex makes the header with the given hash and height the tip of the
+// index. Every entry above it is removed, so it must be indexed at height.
+func (h *headerIndex) rollbackIndex(tip *chainhash.Hash, height uint32) error {
+	tipKey, err := h.indexType.TipKey()
+	if err != nil {
+		return err
+	}
+
+	return walletdb.Update(h.db, func(tx walletdb.ReadWriteTx) error {
+		rootBucket := tx.ReadWriteBucket(indexBucket)
+
+		indexed, err := getHeaderEntry(rootBucket, tip[:])
+		if err != nil {
+			return corruptErrf("header %v at height %d isn't in "+
+				"the index: %w", tip, height, err)
+		}
+		if indexed != height {
+			return corruptErrf("header %v is indexed at height "+
+				"%d, expected %d", tip, indexed, height)
+		}
+
+		if _, err := deleteEntriesAbove(rootBucket, height); err != nil {
+			return err
+		}
+
+		return rootBucket.Put(tipKey, tip[:])
+	})
+}
+
+// setTipAtHeight points the tip at the header indexed at height. Index entries
+// are left alone, as the filter headers' tip refers to entries that belong to
+// the block headers.
+func (h *headerIndex) setTipAtHeight(height uint32) error {
+	tipKey, err := h.indexType.TipKey()
+	if err != nil {
+		return err
+	}
+
+	return walletdb.Update(h.db, func(tx walletdb.ReadWriteTx) error {
+		rootBucket := tx.ReadWriteBucket(indexBucket)
+
+		hash, err := hashAtHeight(rootBucket, height)
+		if err != nil {
+			return corruptErrf("no header to point the %v tip at "+
+				"height %d: %w", h.indexType, height, err)
+		}
+
+		return rootBucket.Put(tipKey, hash[:])
+	})
+}
+
+// blockTipHeight returns the height of the block header tip in the index.
+func (h *headerIndex) blockTipHeight() (uint32, error) {
+	var height uint32
+	err := walletdb.View(h.db, func(tx walletdb.ReadTx) error {
+		rootBucket := tx.ReadBucket(indexBucket)
+
+		tipHash := rootBucket.Get(blockTip)
+		if tipHash == nil {
+			return fmt.Errorf("the key %s does not exist in "+
+				"bucket %s", blockTip, indexBucket)
+		}
+
+		var err error
+		height, err = getHeaderEntry(rootBucket, tipHash)
+
+		return err
+	})
+
+	return height, err
 }
