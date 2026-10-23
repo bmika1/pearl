@@ -191,6 +191,114 @@ func TestPostHandshakeAuth(t *testing.T) {
 	assert.Equal(t, http.StatusOK, post("user", "pass", true))
 }
 
+// TestStopRequestsProcessShutdown checks that an authenticated stop request,
+// over HTTP POST or websocket, asks the process to shut down, since that is
+// how the desktop wallet exits oyster without killing it. Without valid
+// credentials it must not.
+func TestStopRequestsProcessShutdown(t *testing.T) {
+	t.Parallel()
+
+	newServer := func(t *testing.T) (*Server, string) {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+
+		opts := &Options{
+			Username:            "user",
+			Password:            "pass",
+			MaxPOSTClients:      10,
+			MaxWebsocketClients: 10,
+		}
+		srv := NewServer(opts, nil, []net.Listener{lis})
+		srv.Start()
+		t.Cleanup(srv.Stop)
+
+		return srv, lis.Addr().String()
+	}
+
+	requireShutdownRequested := func(t *testing.T, srv *Server) {
+		select {
+		case <-srv.RequestProcessShutdown():
+		case <-time.After(5 * time.Second):
+			t.Fatal("shutdown was not requested")
+		}
+	}
+
+	requireNoShutdownRequested := func(t *testing.T, srv *Server) {
+		select {
+		case <-srv.RequestProcessShutdown():
+			t.Fatal("shutdown was requested")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	const request = `{"jsonrpc":"1.0","id":3,"method":"stop","params":[]}`
+
+	t.Run("post", func(t *testing.T) {
+		t.Parallel()
+
+		srv, addr := newServer(t)
+		post := func(withAuth bool) *http.Response {
+			req, err := http.NewRequest(http.MethodPost,
+				"http://"+addr+"/", strings.NewReader(request))
+			require.NoError(t, err)
+			if withAuth {
+				req.SetBasicAuth("user", "pass")
+			}
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+
+			return resp
+		}
+
+		resp := post(false)
+		resp.Body.Close()
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+		requireNoShutdownRequested(t, srv)
+
+		resp = post(true)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var got struct {
+			Result string          `json:"result"`
+			Error  json.RawMessage `json:"error"`
+		}
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+		assert.Equal(t, "oyster stopping", got.Result)
+		assert.Equal(t, "null", string(got.Error))
+		requireShutdownRequested(t, srv)
+	})
+
+	t.Run("websocket", func(t *testing.T) {
+		t.Parallel()
+
+		srv, addr := newServer(t)
+		dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
+
+		_, resp, err := dialer.Dial("ws://"+addr+"/ws", http.Header{})
+		require.Error(t, err)
+		resp.Body.Close()
+		requireNoShutdownRequested(t, srv)
+
+		h := http.Header{}
+		h.Set("Authorization", "Basic "+
+			base64.StdEncoding.EncodeToString([]byte("user:pass")))
+		conn, resp, err := dialer.Dial("ws://"+addr+"/ws", h)
+		require.NoError(t, err)
+		resp.Body.Close()
+		defer conn.Close()
+
+		require.NoError(t, conn.WriteMessage(
+			websocket.TextMessage, []byte(request),
+		))
+		require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+		_, msg, err := conn.ReadMessage()
+		require.NoError(t, err)
+		assert.Contains(t, string(msg), "oyster stopping")
+		requireShutdownRequested(t, srv)
+	})
+}
+
 func TestThrottle(t *testing.T) {
 	const threshold = 1
 	busy := make(chan struct{})
