@@ -1,6 +1,7 @@
 package neutrino
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"reflect"
@@ -16,6 +17,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/rpcclient"
+	"github.com/pearl-research-labs/pearl/node/txscript"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/spv/blockntfns"
 	"github.com/pearl-research-labs/pearl/spv/headerfs"
@@ -918,4 +920,160 @@ func TestRescanShutdownErrorsExitWhileCatchingUp(t *testing.T) {
 			}
 		})
 	}
+}
+
+func testTaprootAddr(t *testing.T, seed byte) btcutil.Address {
+	t.Helper()
+
+	addr, err := btcutil.NewAddressTaproot(
+		bytes.Repeat([]byte{seed}, 32), &chaincfg.MainNetParams,
+	)
+	require.NoError(t, err)
+
+	return addr
+}
+
+// TestRescanStateResumeOption pins that the option carries the watch lists as they stand when the rescan stops,
+// including the outputs it matched, and the last block it notified.
+func TestRescanStateResumeOption(t *testing.T) {
+	t.Parallel()
+
+	watched := testTaprootAddr(t, 1)
+	watchedScript, err := txscript.PayToAddrScript(watched)
+	require.NoError(t, err)
+
+	rs := &rescanState{
+		opts:     &rescanOptions{watchAddrs: []btcutil.Address{watched}},
+		curStamp: headerfs.BlockStamp{Height: 7, Hash: chainhash.Hash{7}},
+	}
+
+	tx := wire.NewMsgTx(wire.TxVersion)
+	tx.AddTxOut(wire.NewTxOut(1000, watchedScript))
+	matched, err := rs.opts.paysWatchedAddr(btcutil.NewTx(tx))
+	require.NoError(t, err)
+	require.True(t, matched)
+
+	resume := rs.resumeOption()
+
+	restored := &rescanOptions{}
+	resume(restored)
+
+	require.Equal(t, []btcutil.Address{watched}, restored.watchAddrs)
+	require.Equal(t, []InputWithScript{{
+		OutPoint: wire.OutPoint{Hash: tx.TxHash()},
+		PkScript: watchedScript,
+	}}, restored.watchInputs)
+	require.Equal(t,
+		&headerfs.BlockStamp{Height: 7, Hash: chainhash.Hash{7}},
+		restored.startBlock,
+	)
+
+	// Each application gets its own copy, so a rescan's updates never reach another.
+	other := &rescanOptions{}
+	resume(other)
+	restored.watchAddrs[0] = nil
+	require.Equal(t, []btcutil.Address{watched}, other.watchAddrs)
+}
+
+// TestRescanResumeAfterExit pins that a rescan built from ResumeOptions starts at the block after the last one the
+// exited rescan notified and keeps matching filters against its watch list.
+func TestRescanResumeAfterExit(t *testing.T) {
+	t.Parallel()
+
+	ctx := newRescanTestContext(t, 10,
+		StartTime(time.Time{}),
+		WatchInputs(InputWithScript{PkScript: testWatchScript}),
+	)
+	ctx.start(true)
+
+	require.Nil(t, ctx.rescan.ResumeOptions(), "a running rescan has nothing to resume")
+
+	block1 := ctx.chain.addNewBlock(true)
+	ctx.assertFilterQueried(block1.Hash)
+	ctx.recvBlockConnected(block1)
+
+	// The rescan cannot recover from a canceled block subscription, so it exits.
+	close(ctx.chain.ntfnChan)
+	select {
+	case err := <-ctx.errChan:
+		require.ErrorContains(t, err, "block subscription was canceled")
+	case <-time.After(time.Second):
+		t.Fatal("expected rescan to exit when its block subscription is canceled")
+	}
+
+	block2 := ctx.chain.addNewBlock(false)
+
+	resumeOptions := ctx.rescan.ResumeOptions()
+	require.NotNil(t, resumeOptions)
+
+	ctx.chain.mu.Lock()
+	ctx.chain.ntfnChan = make(chan blockntfns.BlockNtfn)
+	ctx.chain.mu.Unlock()
+
+	// Block notifications are only read once the rescan has caught up and subscribed.
+	subscribed := make(chan struct{}, 1)
+	ctx.chain.overrideSubscribe(func(uint32) (*blockntfns.Subscription, error) {
+		select {
+		case subscribed <- struct{}{}:
+		default:
+		}
+
+		return &blockntfns.Subscription{
+			Notifications: ctx.chain.ntfnChan,
+			Cancel:        func() {},
+		}, nil
+	})
+
+	ctx.rescan = NewRescan(ctx.chain, resumeOptions...)
+	ctx.errChan = ctx.rescan.Start()
+	defer ctx.stop()
+
+	ctx.assertFilterQueried(block2.Hash)
+	ctx.recvBlockConnected(block2)
+
+	select {
+	case <-subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("expected the resumed rescan to catch up and subscribe")
+	}
+
+	block3 := ctx.chain.addNewBlock(true)
+	ctx.assertFilterQueried(block3.Hash)
+	ctx.recvBlockConnected(block3)
+}
+
+// TestRescanResumeOptionsAfterFailedCatchUpBlock pins that a rescan which exits on a block it could not notify resumes
+// at the block before it, so the failed block is scanned again.
+func TestRescanResumeOptionsAfterFailedCatchUpBlock(t *testing.T) {
+	t.Parallel()
+
+	ctx := newRescanTestContext(t, 10,
+		StartTime(time.Time{}),
+		WatchInputs(InputWithScript{}),
+	)
+	ctx.start(true)
+
+	block1 := ctx.chain.addNewBlock(true)
+	ctx.assertFilterQueried(block1.Hash)
+	ctx.recvBlockConnected(block1)
+
+	ctx.chain.setGetFilterErr(ErrShuttingDown)
+	block2 := ctx.chain.addNewBlock(false)
+	ctx.chain.ntfnChan <- blockntfns.NewBlockConnected(wire.BlockHeader{}, 0)
+	ctx.assertFilterQueried(block2.Hash)
+
+	select {
+	case err := <-ctx.errChan:
+		require.ErrorIs(t, err, ErrShuttingDown)
+	case <-time.After(time.Second):
+		t.Fatal("expected rescan to exit on shutdown error")
+	}
+
+	restored := &rescanOptions{}
+	for _, option := range ctx.rescan.ResumeOptions() {
+		option(restored)
+	}
+
+	require.Equal(t, block1.Hash, restored.startBlock.Hash)
+	require.Equal(t, block1.Height, restored.startBlock.Height)
 }

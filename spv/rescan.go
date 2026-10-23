@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -781,6 +782,10 @@ rescanLoop:
 				}
 
 			default:
+				// A rescan resumed from this one starts at curStamp, so it must name the last block notified.
+				rs.curHeader = prevHeader
+				rs.curStamp = prevStamp
+
 				return err
 			}
 		}
@@ -804,6 +809,22 @@ func (rs *rescanState) waitForRetry(interval time.Duration) error {
 
 	case <-time.After(interval):
 		return nil
+	}
+}
+
+// resumeOption captures what a replacement rescan needs to continue from where this one stopped. The watch lists grow
+// while the rescan runs, with updates and with the outputs it matches, so the options it was created with are stale.
+func (rs *rescanState) resumeOption() RescanOption {
+	addrs := slices.Clone(rs.opts.watchAddrs)
+	inputs := slices.Clone(rs.opts.watchInputs)
+	start := rs.curStamp
+
+	return func(ro *rescanOptions) {
+		ro.watchAddrs = slices.Clone(addrs)
+		ro.watchInputs = slices.Clone(inputs)
+
+		startBlock := start
+		ro.startBlock = &startBlock
 	}
 }
 
@@ -1402,6 +1423,7 @@ type Rescan struct { // nolint:maligned
 
 	errMtx sync.Mutex
 	err    error
+	resume RescanOption
 
 	wg sync.WaitGroup
 }
@@ -1445,16 +1467,42 @@ func (r *Rescan) Start() <-chan error {
 			err = rs.rescan()
 		}
 
-		close(r.running)
-
+		// Whoever observes running closed must also see err and resume.
 		r.errMtx.Lock()
 		r.err = err
+		if rs != nil {
+			r.resume = rs.resumeOption()
+		}
 		r.errMtx.Unlock()
+
+		close(r.running)
 
 		errChan <- err
 	}()
 
 	return errChan
+}
+
+// ResumeOptions returns the options for a new rescan that continues where this one exited. The new rescan watches every
+// address and input this one did, including the outputs it matched along the way, and starts at the last block this
+// one notified. The options include those this rescan was created with, so a caller replaces one of them, such as
+// QuitChan, by appending its own. It returns nil while the rescan is running, and if it exited before it started
+// scanning.
+func (r *Rescan) ResumeOptions() []RescanOption {
+	select {
+	case <-r.running:
+	default:
+		return nil
+	}
+
+	r.errMtx.Lock()
+	defer r.errMtx.Unlock()
+
+	if r.resume == nil {
+		return nil
+	}
+
+	return append(slices.Clone(r.options), r.resume)
 }
 
 // updateOptions are a set of functional parameters for Update.

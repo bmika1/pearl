@@ -555,16 +555,26 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 		return s.rescan.Update(neutrino.AddAddrs(addrs...))
 	}
 
+	// A fresh rescan would watch only addrs and start at the tip, so continue one that exited to keep the addresses and
+	// outputs it watched and the blocks since its last.
+	var resumeOptions []neutrino.RescanOption
+	if s.rescan != nil {
+		resumeOptions = s.rescan.ResumeOptions()
+	}
+
 	s.rescanQuit = make(chan struct{})
 	s.scanning = true
 
-	// Don't need RescanFinished or RescanProgress notifications.
-	s.finished = true
-	s.lastProgressSent = true
-	s.lastFilteredBlockHeader = nil
+	// Don't need RescanFinished or RescanProgress notifications, except from a resumed rescan that has yet to send
+	// RescanFinished.
+	if resumeOptions == nil {
+		s.finished = true
+		s.lastProgressSent = true
+		s.lastFilteredBlockHeader = nil
+	}
 
-	// Rescan with just the specified addresses.
-	newRescan := s.newRescan(
+	// Watch the specified addresses, in addition to those a resumed rescan carries.
+	newRescan := s.newRescan(append(resumeOptions,
 		neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
 			OnBlockConnected:         s.onBlockConnected,
 			OnFilteredBlockConnected: s.onFilteredBlockConnected,
@@ -573,7 +583,7 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 		neutrino.StartTime(s.startTime),
 		neutrino.QuitChan(s.rescanQuit),
 		neutrino.WatchAddrs(addrs...),
-	)
+	)...)
 	s.rescan = newRescan
 	s.setRescanErr(s.rescan.Start())
 	s.clientMtx.Unlock()
