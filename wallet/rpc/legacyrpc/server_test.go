@@ -44,6 +44,22 @@ func TestCheckCredentials(t *testing.T) {
 
 }
 
+// startTestServer starts a server for the user "user" with the password "pass", and returns it with the address it
+// listens on.
+func startTestServer(t *testing.T) (*Server, string) {
+	t.Helper()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	opts := &Options{Username: "user", Password: "pass", MaxPOSTClients: 10, MaxWebsocketClients: 10}
+	srv := NewServer(opts, nil, []net.Listener{lis})
+	srv.Start()
+	t.Cleanup(srv.Stop)
+
+	return srv, lis.Addr().String()
+}
+
 // TestWebsocketHandshakeAuth is the regression test for the former
 // authentication bypass: a websocket client with missing or incorrect
 // credentials must be rejected during the HTTP handshake (HTTP 401), before
@@ -51,20 +67,8 @@ func TestCheckCredentials(t *testing.T) {
 func TestWebsocketHandshakeAuth(t *testing.T) {
 	t.Parallel()
 
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-
-	opts := &Options{
-		Username:            "user",
-		Password:            "pass",
-		MaxPOSTClients:      10,
-		MaxWebsocketClients: 10,
-	}
-	srv := NewServer(opts, nil, []net.Listener{lis})
-	srv.Start()
-	defer srv.Stop()
-
-	url := "ws://" + lis.Addr().String() + "/ws"
+	_, addr := startTestServer(t)
+	url := "ws://" + addr + "/ws"
 	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
 
 	dial := func(user, pass string, withAuth bool) (int, error) {
@@ -108,25 +112,14 @@ func TestWebsocketHandshakeAuth(t *testing.T) {
 func TestWebsocketAuthenticateHandledLocally(t *testing.T) {
 	t.Parallel()
 
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-
-	opts := &Options{
-		Username:            "user",
-		Password:            "pass",
-		MaxPOSTClients:      10,
-		MaxWebsocketClients: 10,
-	}
-	srv := NewServer(opts, nil, []net.Listener{lis})
-	srv.Start()
-	defer srv.Stop()
+	_, addr := startTestServer(t)
 
 	h := http.Header{}
 	cred := base64.StdEncoding.EncodeToString([]byte("user:pass"))
 	h.Set("Authorization", "Basic "+cred)
 
 	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
-	conn, resp, err := dialer.Dial("ws://"+lis.Addr().String()+"/ws", h)
+	conn, resp, err := dialer.Dial("ws://"+addr+"/ws", h)
 	require.NoError(t, err)
 	if resp != nil {
 		resp.Body.Close()
@@ -157,20 +150,8 @@ func TestWebsocketAuthenticateHandledLocally(t *testing.T) {
 func TestPostHandshakeAuth(t *testing.T) {
 	t.Parallel()
 
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-
-	opts := &Options{
-		Username:            "user",
-		Password:            "pass",
-		MaxPOSTClients:      10,
-		MaxWebsocketClients: 10,
-	}
-	srv := NewServer(opts, nil, []net.Listener{lis})
-	srv.Start()
-	defer srv.Stop()
-
-	endpoint := "http://" + lis.Addr().String() + "/"
+	_, addr := startTestServer(t)
+	endpoint := "http://" + addr + "/"
 	body := `{"jsonrpc":"1.0","id":1,"method":"getinfo","params":[]}`
 
 	post := func(user, pass string, withAuth bool) int {
@@ -196,21 +177,9 @@ func TestPostHandshakeAuth(t *testing.T) {
 func TestStopRequestsProcessShutdown(t *testing.T) {
 	t.Parallel()
 
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-
-	opts := &Options{
-		Username:            "user",
-		Password:            "pass",
-		MaxPOSTClients:      10,
-		MaxWebsocketClients: 10,
-	}
-	srv := NewServer(opts, nil, []net.Listener{lis})
-	srv.Start()
-	defer srv.Stop()
-
+	srv, addr := startTestServer(t)
 	body := strings.NewReader(`{"jsonrpc":"1.0","id":1,"method":"stop"}`)
-	req, err := http.NewRequest(http.MethodPost, "http://"+lis.Addr().String()+"/", body)
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/", body)
 	require.NoError(t, err)
 	req.SetBasicAuth("user", "pass")
 	resp, err := http.DefaultClient.Do(req)
