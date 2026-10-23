@@ -79,10 +79,10 @@ func (r *syncDataReset) try(netDir string, cause error) bool {
 }
 
 // moveAsideSyncData renames the chain sync files in netDir to
-// <name>.corrupt-<unix time> instead of deleting them. Missing files are
-// skipped and the first failure stops the move, so later files are left as
-// they were. No other file in netDir is touched, in particular not the wallet
-// database.
+// <name>.corrupt-<unix time>, which keeps the data around for diagnosis.
+// Missing files are skipped and the first failure stops the move, so later
+// files are left as they were. No other file in netDir is touched, in
+// particular not the wallet database.
 func moveAsideSyncData(netDir string, now time.Time,
 	rename func(oldpath, newpath string) error) ([]movedFile, error) {
 

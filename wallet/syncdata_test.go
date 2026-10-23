@@ -446,8 +446,8 @@ func TestConnectLoopStopsWhileRetrying(t *testing.T) {
 }
 
 // TestConnectLoopReconnectsAfterClientStops makes sure a chain client that goes
-// away is replaced by a new one on the same database, which used to fail with
-// a timeout because the previous attempt never let go of the database.
+// away is replaced by a new one on the same database, which only works if the
+// previous attempt let go of the database.
 func TestConnectLoopReconnectsAfterClientStops(t *testing.T) {
 	netDir := useTestChain(t, t.TempDir(), 3*time.Second)
 

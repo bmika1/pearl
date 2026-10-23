@@ -176,8 +176,8 @@ func walletMain() error {
 	}
 
 	// The chain client is stopped first, so that anything the wallet is
-	// still waiting for from it, such as a recovery batch, ends at once
-	// instead of holding up the shutdown.
+	// still waiting for from it, such as a recovery batch, ends at once and
+	// can't hold up the shutdown.
 	addInterruptHandler(cancelChain)
 
 	<-interruptHandlersDone
