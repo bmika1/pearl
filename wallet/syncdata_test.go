@@ -373,6 +373,10 @@ func TestConnectLoopResetsCorruptSyncData(t *testing.T) {
 func TestConnectLoopStopsWhileRetrying(t *testing.T) {
 	netDir := useTestChain(t, t.TempDir(), 50*time.Millisecond)
 
+	prevMin, prevMax := chainClientRetryMin, chainClientRetryMax
+	chainClientRetryMin, chainClientRetryMax = time.Minute, time.Minute
+	t.Cleanup(func() { chainClientRetryMin, chainClientRetryMax = prevMin, prevMax })
+
 	// Hold the chain database so every attempt to open it times out.
 	held, err := walletdb.Create(
 		"bdb", filepath.Join(netDir, neutrinoDBName), true,
@@ -392,7 +396,7 @@ func TestConnectLoopStopsWhileRetrying(t *testing.T) {
 	start := time.Now()
 	cancel()
 	waitStopped(t, done)
-	require.Less(t, time.Since(start), chainClientRetryMin)
+	require.Less(t, time.Since(start), 10*time.Second)
 }
 
 // TestConnectLoopReconnectsAfterClientStops makes sure a chain client that goes

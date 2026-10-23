@@ -27,12 +27,14 @@ var (
 	cfg *config
 )
 
-const (
-	// chainClientRetryMin and chainClientRetryMax bound the delay between
-	// attempts to bring up the chain client.
+// chainClientRetryMin and chainClientRetryMax bound the delay between attempts
+// to bring up the chain client.
+var (
 	chainClientRetryMin = time.Second
 	chainClientRetryMax = 30 * time.Second
+)
 
+const (
 	// chainClientStableRun is how long a chain client has to run before the
 	// delay between attempts starts over.
 	chainClientStableRun = time.Minute
