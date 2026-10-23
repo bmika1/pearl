@@ -1,10 +1,8 @@
 import assert from 'node:assert/strict';
 import {EventEmitter} from 'node:events';
-import {readFileSync} from 'node:fs';
-import {createRequire} from 'node:module';
 import {test} from 'node:test';
-import {fileURLToPath} from 'node:url';
-import ts from 'typescript';
+
+import {loadSource} from './load-source.mjs';
 
 // Every spawned command is passed to runCommand, which returns its exit code.
 let runCommand = () => 0;
@@ -17,18 +15,7 @@ const childProcess = {
   },
 };
 
-const sourcePath = fileURLToPath(new URL('../src/main/services/process-shutdown.ts', import.meta.url));
-const {outputText} = ts.transpileModule(readFileSync(sourcePath, 'utf8'), {
-  compilerOptions: {module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022},
-});
-const requireFromSource = createRequire(sourcePath);
-const module = {exports: {}};
-new Function('require', 'module', 'exports', outputText)(
-  id => (id === 'child_process' ? childProcess : requireFromSource(id)),
-  module,
-  module.exports
-);
-const {shutdownProcess} = module.exports;
+const {shutdownProcess} = loadSource({child_process: childProcess})('src/main/services/process-shutdown.ts');
 
 class FakeProcess extends EventEmitter {
   constructor(exitsOn = []) {
