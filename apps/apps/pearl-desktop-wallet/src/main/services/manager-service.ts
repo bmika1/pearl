@@ -103,9 +103,7 @@ class ManagerService implements ManagerApi {
     // Create and import spawn a child that is not the long-running daemon.
     // Stop it before will-quit wipes wallet-setup.json.
     await this.walletProcess.stopSetupChild();
-    if (this.walletProcess.getStatus().isRunning) {
-      await this.walletProcess.stop(options);
-    }
+    await this.walletProcess.stop(options);
   }
 
   async startWalletProcess() {

@@ -7,6 +7,16 @@ import path from 'path';
 import { WalletService } from './wallet-service/wallet-service';
 import { getCurrentNetworkConfig } from '../config/network-config';
 import { removeSetupFile, setupFileGeneration, untrackSetupFile, writeSetupFile } from './setup-file';
+import { shutdownProcess, terminatePids } from './process-shutdown';
+
+// How long oyster gets to exit after it is asked to stop. Its shutdown is quick unless the wallet is in the middle
+// of a recovery batch.
+const STOP_TIMEOUT_MS = 10_000;
+// Locking while the wallet recovers can't wait for that, so oyster only gets a moment before it is killed.
+const FORCE_STOP_TIMEOUT_MS = 2_000;
+const TERMINATE_TIMEOUT_MS = 5_000;
+const KILL_TIMEOUT_MS = 5_000;
+const STRAY_TERMINATE_TIMEOUT_MS = 5_000;
 
 const binaryNameMap: Record<string, Record<string, string>> = {
   win32: {
@@ -430,49 +440,38 @@ class WalletProcess {
   }
 
   async stop(options: { force?: boolean } = {}) {
-    if (!this.isProcessRunning || !this.process) {
+    // A process that was spawned but isn't answering RPC yet must be stopped too, or it outlives the app and holds
+    // the wallet files and the RPC port.
+    const proc = this.process;
+    if (!proc) {
       return { success: false as const, message: 'Wallet is not running' };
     }
 
-    return new Promise<{ success: true; message: string }>(resolve => {
-      if (!this.process) {
-        resolve({ success: true, message: 'Wallet is not running' });
-        return;
-      }
-
-      const proc = this.process;
-
-      proc.once('exit', () => {
-        this.isProcessRunning = false;
-        this.process = null;
-        resolve({
-          success: true,
-          message: options.force ? 'Wallet force stopped' : 'Wallet stopped successfully',
-        });
-      });
-
-      // When `force` is set, skip the polite SIGTERM. The Go wallet's Stop()
-      // waits for `<-endRecovery()`, which only returns after the current
-      // 2000-block recovery batch completes; during block scanning that can
-      // take a minute or more. bbolt commits are atomic at txn boundaries, so
-      // a mid-batch SIGKILL is safe to replay on the next launch.
-      if (options.force) {
-        proc.kill('SIGKILL');
-        return;
-      }
-
-      proc.kill('SIGTERM');
-
-      // `ChildProcess.killed` flips to true as soon as *any* signal is
-      // dispatched, regardless of whether the process actually died. Use our
-      // own `isProcessRunning` flag (cleared in the 'exit' handler above) to
-      // detect a process that ignored SIGTERM.
-      setTimeout(() => {
-        if (this.isProcessRunning && this.process === proc) {
-          proc.kill('SIGKILL');
-        }
-      }, 5000);
+    const stopTimeoutMs = options.force ? FORCE_STOP_TIMEOUT_MS : STOP_TIMEOUT_MS;
+    const outcome = await shutdownProcess(proc, {
+      requestStop: () => this.walletService.stopDaemon(stopTimeoutMs),
+      stopTimeoutMs,
+      terminateTimeoutMs: TERMINATE_TIMEOUT_MS,
+      killTimeoutMs: KILL_TIMEOUT_MS,
+      // A termination request meets the same slow shutdown the stop request just did.
+      skipTerminate: options.force,
+      log,
     });
+    log.info(`Wallet process shutdown: ${outcome}`);
+
+    if (outcome === 'timeout') {
+      return { success: false as const, message: 'Wallet process did not exit' };
+    }
+
+    if (this.process === proc) {
+      this.isProcessRunning = false;
+      this.process = null;
+    }
+
+    return {
+      success: true as const,
+      message: options.force ? 'Wallet force stopped' : 'Wallet stopped successfully',
+    };
   }
 
   async killExistingWalletProcesses() {
@@ -503,11 +502,11 @@ class WalletProcess {
           }
 
           if (pids.length > 0) {
-            for (const pid of pids) {
-              try {
-                spawn('kill', ['-9', pid]);
-              } catch { }
-            }
+            terminatePids(pids.map(Number).filter(Number.isInteger), {
+              timeoutMs: STRAY_TERMINATE_TIMEOUT_MS,
+              log,
+            }).finally(resolve);
+            return;
           }
         }
         resolve();
