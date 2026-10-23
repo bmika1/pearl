@@ -585,6 +585,12 @@ func TestFilterHeaderStateAssertion(t *testing.T) {
 			t.Fatalf("unable to write filter headers: %v", err)
 		}
 
+		// Windows can't remove a file that is still open, which an incorrect assertion does.
+		if err := fhs.(*filterHeaderStore).Close(); err != nil {
+			cleanUp()
+			t.Fatalf("unable to close filter header store: %v", err)
+		}
+
 		return cleanUp, tempDir, db
 	}
 
