@@ -368,10 +368,6 @@ func startSPVChain(ctx context.Context, netDir string) (chain.Interface,
 	chainClient := chain.NewNeutrinoClient(activeNet.Params, spv.chainService)
 	if err := chainClient.Start(ctx); err != nil {
 		log.Errorf("Couldn't start Neutrino client: %s", err)
-
-		// A service that failed to start can't be stopped, so only the
-		// database can be let go.
-		spv.chainService = nil
 		spv.close()
 
 		return nil, nil, err
