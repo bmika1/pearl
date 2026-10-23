@@ -831,7 +831,9 @@ func (rs *rescanState) waitForRetry(interval time.Duration) error {
 }
 
 // resumeOverlap is how many blocks before the last one notified a resumed rescan starts when that block has left the
-// best chain, so that the blocks which replaced it are notified. A reorg deeper than this is not repaired.
+// best chain, so the blocks which replaced it, and any below it that were replaced too, are scanned on the best chain.
+// Only the last block is reported as disconnected, since the rescan keeps no hash for the ones below it, so the caller
+// reconciles what it recorded in those.
 const resumeOverlap = 6
 
 // reorgedTip is a block a rescan notified that has since left the best chain.
@@ -1538,10 +1540,10 @@ func (r *Rescan) Start() <-chan error {
 
 // ResumeOptions returns the options for a new rescan that continues where this one exited. The new rescan watches every
 // address and input this one did, including the outputs it matched along the way, and starts at the last block this
-// one notified, or a few blocks earlier if that block has since left the best chain, in which case blocks the caller
-// already has are notified again. The options include those this rescan was created with, so a caller replaces one of
-// them, such as QuitChan, by appending its own. It returns nil while the rescan is running, and if it exited before it
-// started scanning.
+// one notified, or a few blocks earlier if that block has since left the best chain, in which case it is reported as
+// disconnected and blocks the caller already has are notified again. The options include those this rescan was
+// created with, so a caller replaces one of them, such as QuitChan, by appending its own. It returns nil while the
+// rescan is running, and if it exited before it started scanning.
 func (r *Rescan) ResumeOptions() []RescanOption {
 	select {
 	case <-r.running:
