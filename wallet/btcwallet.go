@@ -32,6 +32,10 @@ var (
 	chainClientRetryMax = 30 * time.Second
 )
 
+// chainLoopStopTimeout bounds how long shutdown waits for the chain client to close its files, so a chain service that
+// is slow to stop can't hold up the exit.
+const chainLoopStopTimeout = 5 * time.Second
+
 func main() {
 	// Use all processor cores.
 	runtime.GOMAXPROCS(runtime.NumCPU())
@@ -98,8 +102,14 @@ func walletMain() error {
 	// the wallet when loaded later.
 	chainCtx, cancelChain := context.WithCancel(context.Background())
 	defer cancelChain()
+	chainLoopDone := make(chan struct{})
 	if !cfg.NoInitialLoad {
-		go rpcClientConnectLoop(chainCtx, legacyRPCServer, loader)
+		go func() {
+			defer close(chainLoopDone)
+			rpcClientConnectLoop(chainCtx, legacyRPCServer, loader)
+		}()
+	} else {
+		close(chainLoopDone)
 	}
 
 	loader.RunAfterLoad(func(w *wallet.Wallet) {
@@ -119,6 +129,15 @@ func walletMain() error {
 	// Add interrupt handlers to shutdown the various process components
 	// before exiting.  Interrupt handlers run in LIFO order, so the wallet
 	// (which should be closed last) is added first.
+	//
+	// Waiting for the chain client to close the chain database and header files is added before it, as the last step.
+	addInterruptHandler(func() {
+		select {
+		case <-chainLoopDone:
+		case <-time.After(chainLoopStopTimeout):
+			log.Warn("Timed out waiting for the chain client to stop")
+		}
+	})
 	addInterruptHandler(func() {
 		err := loader.UnloadWallet()
 		if err != nil && err != wallet.ErrNotLoaded {
