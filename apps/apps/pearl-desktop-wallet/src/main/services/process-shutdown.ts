@@ -9,8 +9,6 @@ interface ShutdownOptions {
   signalTimeoutMs: number;
   // For callers that can't wait for a process that is slow to exit.
   skipTerminate?: boolean;
-  platform?: NodeJS.Platform;
-  closeWindowsProcess?: (pid: number) => Promise<boolean>;
 }
 
 function hasExited(proc: ChildProcess): boolean {
@@ -48,10 +46,10 @@ function closeWindowsProcess(pid: number): Promise<boolean> {
   });
 }
 
-// Every signal sent through a child handle on Windows is a hard kill, so there the stop request is the only clean
-// way out. Resolves true once the process has exited.
+// On Windows every signal sent through the child handle is a hard kill, so the termination request goes through
+// taskkill instead. Resolves true once the process has exited.
 async function shutdownProcess(proc: ChildProcess, options: ShutdownOptions): Promise<boolean> {
-  if (hasExited(proc)) {
+  if (proc.pid === undefined || hasExited(proc)) {
     return true;
   }
 
@@ -68,10 +66,7 @@ async function shutdownProcess(proc: ChildProcess, options: ShutdownOptions): Pr
   }
 
   if (!options.skipTerminate) {
-    const terminating =
-      (options.platform ?? process.platform) === 'win32'
-        ? await (options.closeWindowsProcess ?? closeWindowsProcess)(proc.pid ?? -1)
-        : proc.kill('SIGTERM');
+    const terminating = process.platform === 'win32' ? await closeWindowsProcess(proc.pid) : proc.kill('SIGTERM');
     if (await waitForExit(proc, terminating ? options.signalTimeoutMs : 0)) {
       return true;
     }
@@ -83,4 +78,3 @@ async function shutdownProcess(proc: ChildProcess, options: ShutdownOptions): Pr
 }
 
 export {shutdownProcess};
-export type {ShutdownOptions};
