@@ -505,26 +505,33 @@ func deleteHeaderEntries(rootBucket walletdb.ReadWriteBucket,
 	return nil
 }
 
-// forEachEntry calls fn with every hash and height in the index's sub buckets.
-// It runs while recovering from a crash, so entries that don't hold a height
-// are skipped rather than read.
+// forEachEntry calls fn with every hash and height in the index. Entries are
+// kept in sub buckets or, by older versions, in the root bucket. It runs while
+// recovering from a crash, so entries that don't hold a height are skipped
+// rather than read.
 func forEachEntry(rootBucket walletdb.ReadBucket,
 	fn func(hash chainhash.Hash, height uint32) error) error {
 
-	return rootBucket.ForEach(func(k, _ []byte) error {
-		subBucket := rootBucket.NestedReadBucket(k)
-		if subBucket == nil {
+	visit := func(k, v []byte) error {
+		if len(k) != chainhash.HashSize || len(v) != 4 {
 			return nil
 		}
 
-		return subBucket.ForEach(func(k, v []byte) error {
-			var hash chainhash.Hash
-			if copy(hash[:], k) != chainhash.HashSize || len(v) != 4 {
-				return nil
-			}
+		var hash chainhash.Hash
+		copy(hash[:], k)
 
-			return fn(hash, binary.BigEndian.Uint32(v))
-		})
+		return fn(hash, binary.BigEndian.Uint32(v))
+	}
+
+	return rootBucket.ForEach(func(k, v []byte) error {
+		if v != nil {
+			return visit(k, v)
+		}
+		if subBucket := rootBucket.NestedReadBucket(k); subBucket != nil {
+			return subBucket.ForEach(visit)
+		}
+
+		return nil
 	})
 }
 
@@ -582,14 +589,14 @@ func (h *headerIndex) setTipAtHeight(height uint32) error {
 
 		var tip *chainhash.Hash
 		err := forEachEntry(rootBucket, func(hash chainhash.Hash, at uint32) error {
-			if at != height {
-				return nil
-			}
-			if tip != nil {
+			switch {
+			case at != height:
+			case tip != nil && *tip != hash:
 				return fmt.Errorf("several headers at height %d",
 					height)
+			default:
+				tip = &hash
 			}
-			tip = &hash
 
 			return nil
 		})
