@@ -44,22 +44,6 @@ func TestCheckCredentials(t *testing.T) {
 
 }
 
-// startTestServer starts a server for the user "user" with the password "pass", and returns it with the address it
-// listens on.
-func startTestServer(t *testing.T) (*Server, string) {
-	t.Helper()
-
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-
-	opts := &Options{Username: "user", Password: "pass", MaxPOSTClients: 10, MaxWebsocketClients: 10}
-	srv := NewServer(opts, nil, []net.Listener{lis})
-	srv.Start()
-	t.Cleanup(srv.Stop)
-
-	return srv, lis.Addr().String()
-}
-
 // TestWebsocketHandshakeAuth is the regression test for the former
 // authentication bypass: a websocket client with missing or incorrect
 // credentials must be rejected during the HTTP handshake (HTTP 401), before
@@ -226,4 +210,20 @@ func TestThrottle(t *testing.T) {
 	}
 
 	require.Equal(t, map[int]int{200: 1, 429: 1}, got)
+}
+
+// startTestServer starts a server for the user "user" with the password "pass", and returns it with the address it
+// listens on.
+func startTestServer(t *testing.T) (*Server, string) {
+	t.Helper()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	opts := &Options{Username: "user", Password: "pass", MaxPOSTClients: 10, MaxWebsocketClients: 10}
+	srv := NewServer(opts, nil, []net.Listener{lis})
+	srv.Start()
+	t.Cleanup(srv.Stop)
+
+	return srv, lis.Addr().String()
 }

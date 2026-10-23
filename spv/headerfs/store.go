@@ -249,8 +249,8 @@ type headerStore struct {
 }
 
 // newHeaderStore creates a new headerStore given an already open database, a target file path for the flat-file and a
-// particular header type. The target file will be created as necessary, a partial header at its end is cut off, and
-// the number of headers it holds is returned.
+// particular header type. The target file will be created as necessary, a partial header at its end is cut off, and the
+// number of headers it holds is returned.
 func newHeaderStore(db walletdb.DB, filePath string, hType HeaderType) (*headerStore, uint32, error) {
 	var headerFile = &headerFile{}
 
