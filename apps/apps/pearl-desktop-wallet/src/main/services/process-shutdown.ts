@@ -61,7 +61,7 @@ async function shutdownProcess(proc: ChildProcess, options: ShutdownOptions): Pr
     await options.requestStop();
   } catch (error) {
     stopDelivered = false;
-    console.warn(`Could not ask process ${proc.pid} to stop:`, error);
+    console.warn(`Could not ask process ${proc.pid} to stop: ${error instanceof Error ? error.message : error}`);
   }
   if (await waitForExit(proc, stopDelivered ? stopDeadline - Date.now() : 0)) {
     return true;
