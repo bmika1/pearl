@@ -53,12 +53,24 @@ func isSyncDataCorrupt(err error) bool {
 // a loop of resets.
 type syncDataReset struct {
 	done bool
+
+	// rename is os.Rename unless replaced.
+	rename func(oldpath, newpath string) error
 }
 
-// wanted reports whether err calls for a reset that hasn't been done yet, and
-// counts it as done.
-func (r *syncDataReset) wanted(err error) bool {
-	if r.done || !isSyncDataCorrupt(err) {
+// try resets the chain sync data in netDir if cause calls for it and it hasn't
+// been reset before, and reports whether it did. A reset that failed lost
+// nothing, so it may be tried again.
+func (r *syncDataReset) try(netDir string, cause error) bool {
+	if r.done || !isSyncDataCorrupt(cause) {
+		return false
+	}
+
+	rename := r.rename
+	if rename == nil {
+		rename = os.Rename
+	}
+	if !resetSyncData(netDir, cause, rename) {
 		return false
 	}
 	r.done = true
@@ -117,13 +129,15 @@ func quarantinePath(path string, now time.Time) (string, error) {
 
 // resetSyncData moves the chain sync files in netDir aside so the next chain
 // service starts from scratch. It reports whether that worked.
-func resetSyncData(netDir string, cause error) bool {
+func resetSyncData(netDir string, cause error,
+	rename func(oldpath, newpath string) error) bool {
+
 	log.Warnf("The chain sync data in %s is corrupt: %v", netDir, cause)
 	log.Warnf("Resetting the chain sync data: %s are moved aside and the "+
 		"chain is synced again from scratch. The wallet database is not "+
 		"touched.", strings.Join(syncDataFiles, ", "))
 
-	moved, err := moveAsideSyncData(netDir, time.Now(), os.Rename)
+	moved, err := moveAsideSyncData(netDir, time.Now(), rename)
 	for _, file := range moved {
 		log.Infof("Moved %s to %s", file.from, file.to)
 	}

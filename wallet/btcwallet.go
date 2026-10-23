@@ -221,9 +221,7 @@ func rpcClientConnectLoop(ctx context.Context,
 		if cfg.UseSPV {
 			chainClient, spv, err = startSPVChain(ctx, netDir)
 			if err != nil {
-				if syncReset.wanted(err) &&
-					resetSyncData(netDir, err) {
-
+				if syncReset.try(netDir, err) {
 					continue
 				}
 

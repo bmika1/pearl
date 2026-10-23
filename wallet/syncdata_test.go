@@ -252,12 +252,58 @@ func TestIsSyncDataCorrupt(t *testing.T) {
 }
 
 func TestSyncDataResetOnlyOnce(t *testing.T) {
-	var reset syncDataReset
-	corrupt := fmt.Errorf("%w: tip mismatch", headerfs.ErrHeaderStoreCorrupt)
+	silenceLogs()
 
-	require.False(t, reset.wanted(errors.New("timeout")))
-	require.True(t, reset.wanted(corrupt))
-	require.False(t, reset.wanted(corrupt))
+	netDir := t.TempDir()
+	writeSyncFiles := func() {
+		writeFiles(t, netDir, map[string]string{
+			neutrinoDBName:                    "neutrino",
+			headerfs.BlockHeadersFileName:     "blocks",
+			headerfs.RegFilterHeadersFileName: "filters",
+		})
+	}
+	writeSyncFiles()
+
+	corrupt := fmt.Errorf("%w: tip mismatch", headerfs.ErrHeaderStoreCorrupt)
+	var reset syncDataReset
+
+	// Other causes don't call for a reset.
+	require.False(t, reset.try(netDir, errors.New("timeout")))
+	require.FileExists(t, filepath.Join(netDir, neutrinoDBName))
+
+	require.True(t, reset.try(netDir, corrupt))
+	require.NoFileExists(t, filepath.Join(netDir, neutrinoDBName))
+
+	// The files that show up again are left alone.
+	writeSyncFiles()
+	require.False(t, reset.try(netDir, corrupt))
+	require.FileExists(t, filepath.Join(netDir, neutrinoDBName))
+}
+
+// TestSyncDataResetRetriedAfterFailure checks that a reset that couldn't move
+// the files doesn't use up the one reset, since nothing was lost by it.
+func TestSyncDataResetRetriedAfterFailure(t *testing.T) {
+	silenceLogs()
+
+	netDir := t.TempDir()
+	writeFiles(t, netDir, map[string]string{
+		neutrinoDBName:                "neutrino",
+		headerfs.BlockHeadersFileName: "blocks",
+	})
+
+	corrupt := fmt.Errorf("%w: tip mismatch", headerfs.ErrHeaderStoreCorrupt)
+	reset := syncDataReset{
+		rename: func(string, string) error { return errors.New("file in use") },
+	}
+
+	require.False(t, reset.try(netDir, corrupt))
+	require.FileExists(t, filepath.Join(netDir, neutrinoDBName))
+	require.FileExists(t, filepath.Join(netDir, headerfs.BlockHeadersFileName))
+
+	reset.rename = nil
+	require.True(t, reset.try(netDir, corrupt))
+	require.NoFileExists(t, filepath.Join(netDir, neutrinoDBName))
+	require.False(t, reset.try(netDir, corrupt))
 }
 
 // TestStartSPVChainReleasesResources makes sure the chain database can be
