@@ -248,12 +248,10 @@ type headerStore struct {
 	*headerIndex
 }
 
-// newHeaderStore creates a new headerStore given an already open database, a
-// target file path for the flat-file and a particular header type. The target
-// file will be created as necessary.
-func newHeaderStore(db walletdb.DB, filePath string,
-	hType HeaderType) (*headerStore, error) {
-
+// newHeaderStore creates a new headerStore given an already open database, a target file path for the flat-file and a
+// particular header type. The target file will be created as necessary, a partial header at its end is cut off, and
+// the number of headers it holds is returned.
+func newHeaderStore(db walletdb.DB, filePath string, hType HeaderType) (*headerStore, uint32, error) {
 	var headerFile = &headerFile{}
 
 	var flatFileName string
@@ -263,7 +261,7 @@ func newHeaderStore(db walletdb.DB, filePath string,
 	case RegularFilter:
 		flatFileName = RegFilterHeadersFileName
 	default:
-		return nil, fmt.Errorf("unrecognized filter type: %v", hType)
+		return nil, 0, fmt.Errorf("unrecognized filter type: %v", hType)
 	}
 
 	flatFileName = filepath.Join(filePath, flatFileName)
@@ -273,7 +271,7 @@ func newHeaderStore(db walletdb.DB, filePath string,
 	fileFlags := os.O_RDWR | os.O_APPEND | os.O_CREATE
 	file, err := os.OpenFile(flatFileName, fileFlags, 0644)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	headerFile.file = file
 
@@ -282,13 +280,20 @@ func newHeaderStore(db walletdb.DB, filePath string,
 	index, err := newHeaderIndex(db, hType)
 	if err != nil {
 		_ = file.Close()
-		return nil, err
+		return nil, 0, err
 	}
 
-	return &headerStore{
+	store := &headerStore{
 		headerFile:  headerFile,
 		headerIndex: index,
-	}, nil
+	}
+	numHeaders, err := store.trimPartialRecord()
+	if err != nil {
+		_ = store.Close()
+		return nil, 0, err
+	}
+
+	return store, numHeaders, nil
 }
 
 // blockHeaderStore is an implementation of the BlockHeaderStore interface, a
@@ -314,7 +319,7 @@ var _ BlockHeaderStore = (*blockHeaderStore)(nil)
 func NewBlockHeaderStore(filePath string, db walletdb.DB,
 	netParams *chaincfg.Params) (_ BlockHeaderStore, err error) {
 
-	hStore, err := newHeaderStore(db, filePath, Block)
+	hStore, numHeaders, err := newHeaderStore(db, filePath, Block)
 	if err != nil {
 		return nil, err
 	}
@@ -329,11 +334,6 @@ func NewBlockHeaderStore(filePath string, db walletdb.DB,
 			_ = bhs.Close()
 		}
 	}()
-
-	numHeaders, err := bhs.trimPartialRecord()
-	if err != nil {
-		return nil, err
-	}
 
 	// If the file holds no header, then this means that we haven't yet written the initial genesis header to disk, so
 	// we'll do so now. Index entries for headers the file lost would point past its end.
@@ -860,7 +860,7 @@ func NewFilterHeaderStore(filePath string, db walletdb.DB,
 	filterType HeaderType, netParams *chaincfg.Params,
 	headerStateAssertion *FilterHeader) (_ FilterHeaderStore, err error) {
 
-	fStore, err := newHeaderStore(db, filePath, filterType)
+	fStore, numHeaders, err := newHeaderStore(db, filePath, filterType)
 	if err != nil {
 		return nil, err
 	}
@@ -875,11 +875,6 @@ func NewFilterHeaderStore(filePath string, db walletdb.DB,
 			_ = fhs.Close()
 		}
 	}()
-
-	numHeaders, err := fhs.trimPartialRecord()
-	if err != nil {
-		return nil, err
-	}
 
 	// If the file holds no header, then this means that we haven't yet written the initial genesis header to disk, so
 	// we'll do so now.
