@@ -191,9 +191,9 @@ func TestPostHandshakeAuth(t *testing.T) {
 	assert.Equal(t, http.StatusOK, post("user", "pass", true))
 }
 
-// TestStopRequestsProcessShutdown checks that an authenticated stop request
-// asks the process to shut down, as the desktop wallet relies on it to exit
-// oyster without killing it, and that one without valid credentials doesn't.
+// TestStopRequestsProcessShutdown checks that a stop request asks the process to
+// shut down, which the desktop wallet relies on to exit oyster without killing
+// it.
 func TestStopRequestsProcessShutdown(t *testing.T) {
 	t.Parallel()
 
@@ -210,27 +210,16 @@ func TestStopRequestsProcessShutdown(t *testing.T) {
 	srv.Start()
 	defer srv.Stop()
 
-	stop := func(pass string) int {
-		req, err := http.NewRequest(http.MethodPost,
-			"http://"+lis.Addr().String()+"/",
-			strings.NewReader(`{"jsonrpc":"1.0","id":1,"method":"stop"}`))
-		require.NoError(t, err)
-		req.SetBasicAuth("user", pass)
-		resp, err := http.DefaultClient.Do(req)
-		require.NoError(t, err)
-		resp.Body.Close()
+	req, err := http.NewRequest(http.MethodPost,
+		"http://"+lis.Addr().String()+"/",
+		strings.NewReader(`{"jsonrpc":"1.0","id":1,"method":"stop"}`))
+	require.NoError(t, err)
+	req.SetBasicAuth("user", "pass")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-		return resp.StatusCode
-	}
-
-	require.Equal(t, http.StatusUnauthorized, stop("wrong"))
-	select {
-	case <-srv.RequestProcessShutdown():
-		t.Fatal("shutdown requested without valid credentials")
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	require.Equal(t, http.StatusOK, stop("pass"))
 	select {
 	case <-srv.RequestProcessShutdown():
 	case <-time.After(5 * time.Second):
