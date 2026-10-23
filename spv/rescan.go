@@ -912,19 +912,22 @@ type resumeState struct {
 	watchAddrs  []btcutil.Address
 	watchInputs []InputWithScript
 
-	// notified are the blocks the rescan remembered, and lastBlock its position, which only differs from the newest of
-	// them when it notified none.
-	notified  []notifiedBlock
-	lastBlock headerfs.BlockStamp
+	// notified are the blocks the rescan remembered. It is never empty: a rescan that notified none stands at the block
+	// it started from, which its caller holds as well.
+	notified []notifiedBlock
 }
 
 // captureResume records the state a replacement rescan resumes from.
 func (rs *rescanState) captureResume(notified []notifiedBlock) *resumeState {
+	notified = slices.Clone(notified)
+	if len(notified) == 0 {
+		notified = []notifiedBlock{{stamp: rs.curStamp, header: rs.curHeader}}
+	}
+
 	return &resumeState{
 		watchAddrs:  slices.Clone(rs.opts.watchAddrs),
 		watchInputs: slices.Clone(rs.opts.watchInputs),
-		notified:    slices.Clone(notified),
-		lastBlock:   rs.curStamp,
+		notified:    notified,
 	}
 }
 
@@ -933,33 +936,31 @@ func (rs *rescanState) captureResume(notified []notifiedBlock) *resumeState {
 // best chain and reports the next one as disconnected, which makes the caller drop it and every block after it, before
 // it notifies the blocks that replaced them.
 func (s *resumeState) option(chain ChainSource) RescanOption {
-	start, seed := s.lastBlock, s.notified
-
-	var reorgedFrom *notifiedBlock
-	if len(s.notified) > 0 {
-		forkIdx := len(s.notified) - 1
-		for ; forkIdx >= 0; forkIdx-- {
-			if !leftBestChain(chain, &s.notified[forkIdx].stamp.Hash) {
-				break
-			}
+	forkIdx := len(s.notified) - 1
+	for ; forkIdx >= 0; forkIdx-- {
+		if !leftBestChain(chain, &s.notified[forkIdx].stamp.Hash) {
+			break
 		}
+	}
 
-		switch {
-		case forkIdx == len(s.notified)-1:
-			start = s.notified[forkIdx].stamp
+	var (
+		start       headerfs.BlockStamp
+		seed        []notifiedBlock
+		reorgedFrom *notifiedBlock
+	)
+	switch {
+	case forkIdx == len(s.notified)-1:
+		start, seed = s.notified[forkIdx].stamp, s.notified
 
-		case forkIdx >= 0:
-			reorgedFrom = &s.notified[forkIdx+1]
-			start = s.notified[forkIdx].stamp
-			seed = s.notified[:forkIdx+1]
+	case forkIdx >= 0:
+		reorgedFrom = &s.notified[forkIdx+1]
+		start, seed = s.notified[forkIdx].stamp, s.notified[:forkIdx+1]
 
-		// Everything remembered is gone, so the block before the oldest of them is the best this can do.
-		default:
-			reorgedFrom = &s.notified[0]
-			start = headerfs.BlockStamp{
-				Height: max(s.notified[0].stamp.Height-1, 0),
-			}
-			seed = nil
+	// Everything remembered is gone, so the block before the oldest of them is the best this can do.
+	default:
+		reorgedFrom = &s.notified[0]
+		start = headerfs.BlockStamp{
+			Height: max(s.notified[0].stamp.Height-1, 0),
 		}
 	}
 
@@ -1642,8 +1643,9 @@ func (r *Rescan) Start() <-chan error {
 
 // ResumeOptions returns the options for a new rescan that continues where this one exited. The new rescan watches every
 // address and input this one did, including the outputs it matched along the way, and starts at the last block this
-// one notified. If the best chain has dropped blocks this one notified, it starts at the newest that remains and first
-// reports the oldest dropped block as disconnected, which tells the caller to drop it and every block after it. The
+// one notified, or the block it started from if it notified none. If the best chain has dropped blocks this one
+// notified, or its start block, it starts at the newest that remains and first reports the oldest dropped block as
+// disconnected, which tells the caller to drop it and every block after it. The
 // options include those this rescan was created with, so a caller replaces one of them, such as QuitChan, by appending
 // its own. It returns nil while the rescan is running, and if it exited before it started scanning.
 func (r *Rescan) ResumeOptions() []RescanOption {

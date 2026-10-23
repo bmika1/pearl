@@ -1135,12 +1135,17 @@ func TestResumeStateOptionReconcilesNotifiedBlocks(t *testing.T) {
 
 		// headerErr, if set, is what every header lookup fails with instead.
 		headerErr error
+
+		// startOnly has the rescan exit before it notified any block, standing at the newest block.
+		startOnly bool
 	}{
 		{name: "still on the best chain"},
 		{name: "newest dropped", reorgDepth: 1},
 		{name: "newest three dropped", reorgDepth: 3},
 		{name: "all dropped", reorgDepth: numNotified},
 		{name: "lookup fails for another reason", headerErr: errors.New("store closed")},
+		{name: "start block still on the best chain", startOnly: true},
+		{name: "start block dropped", startOnly: true, reorgDepth: 1},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
@@ -1168,9 +1173,17 @@ func TestResumeStateOptionReconcilesNotifiedBlocks(t *testing.T) {
 				chain.addNewBlockWithHeader(&wire.BlockHeader{PrevBlock: best.Hash, Bits: 1}, false)
 			}
 
+			newest := notified[numNotified-1]
 			rs := &rescanState{
-				opts:     &rescanOptions{},
-				curStamp: notified[numNotified-1].stamp,
+				opts:      &rescanOptions{},
+				curStamp:  newest.stamp,
+				curHeader: newest.header,
+			}
+
+			// A rescan that notified nothing remembers only the block it started from.
+			remembered, captured := notified, notified
+			if tt.startOnly {
+				remembered, captured = notified[numNotified-1:], nil
 			}
 
 			var source ChainSource = chain
@@ -1179,24 +1192,25 @@ func TestResumeStateOptionReconcilesNotifiedBlocks(t *testing.T) {
 			}
 
 			restored := &rescanOptions{}
-			rs.captureResume(notified).option(source)(restored)
+			rs.captureResume(captured).option(source)(restored)
 
-			forkIdx := numNotified - 1 - tt.reorgDepth
+			last := len(remembered) - 1
+			forkIdx := last - tt.reorgDepth
 			switch {
 			case tt.reorgDepth == 0 || tt.headerErr != nil:
 				require.Nil(t, restored.reorgedFrom)
-				require.Equal(t, &notified[numNotified-1].stamp, restored.startBlock)
-				require.Equal(t, notified, restored.notifiedSeed)
+				require.Equal(t, &remembered[last].stamp, restored.startBlock)
+				require.Equal(t, remembered, restored.notifiedSeed)
 
 			case forkIdx >= 0:
-				require.Equal(t, &notified[forkIdx+1], restored.reorgedFrom)
-				require.Equal(t, &notified[forkIdx].stamp, restored.startBlock)
-				require.Equal(t, notified[:forkIdx+1], restored.notifiedSeed)
+				require.Equal(t, &remembered[forkIdx+1], restored.reorgedFrom)
+				require.Equal(t, &remembered[forkIdx].stamp, restored.startBlock)
+				require.Equal(t, remembered[:forkIdx+1], restored.notifiedSeed)
 
 			default:
-				require.Equal(t, &notified[0], restored.reorgedFrom)
+				require.Equal(t, &remembered[0], restored.reorgedFrom)
 				require.Equal(t,
-					&headerfs.BlockStamp{Height: notified[0].stamp.Height - 1},
+					&headerfs.BlockStamp{Height: remembered[0].stamp.Height - 1},
 					restored.startBlock,
 				)
 				require.Empty(t, restored.notifiedSeed)
@@ -1297,6 +1311,46 @@ func TestRescanResumeAfterReorgWhileExited(t *testing.T) {
 			ctx.assertSubscribed(subscribed)
 		})
 	}
+}
+
+// TestRescanResumeAfterReorgOfStartBlock pins that a rescan which exited before it notified any block resumes from the
+// block it started from, and reports that block as disconnected if the best chain dropped it.
+func TestRescanResumeAfterReorgOfStartBlock(t *testing.T) {
+	t.Parallel()
+
+	ctx := newRescanTestContext(t, 10,
+		StartTime(time.Time{}),
+		WatchInputs(InputWithScript{PkScript: testWatchScript}),
+	)
+	ctx.start(true)
+
+	startBlock, err := ctx.chain.BestBlock()
+	require.NoError(t, err)
+
+	ctx.exitOnCanceledSubscription()
+
+	ctx.chain.rollbackToHeight(startBlock.Height-1, false)
+	for i := 0; i < 2; i++ {
+		best, err := ctx.chain.BestBlock()
+		require.NoError(t, err)
+
+		ctx.chain.addNewBlockWithHeader(
+			&wire.BlockHeader{PrevBlock: best.Hash, Bits: 1}, false,
+		)
+	}
+
+	subscribed := ctx.resume()
+	defer ctx.stop()
+
+	ctx.recvBlockDisconnected(*startBlock)
+
+	for height := startBlock.Height; height <= startBlock.Height+1; height++ {
+		stamp := ctx.chain.blockStampAt(height)
+		ctx.assertFilterQueried(stamp.Hash)
+		ctx.recvBlockConnected(stamp)
+	}
+
+	ctx.assertSubscribed(subscribed)
 }
 
 // TestRescanResumeOptionsAfterFailedCatchUpBlock pins that a rescan which exits on a block it could not notify resumes
