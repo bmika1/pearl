@@ -169,6 +169,10 @@ func (h *headerFile) truncateHeaders(numHeaders uint32,
 	return h.truncateToSize(fileSize - truncateLength)
 }
 
+// truncatePath is a variable so tests can fail the Windows truncation, which
+// runs after the File is closed and can't be mocked through it.
+var truncatePath = os.Truncate
+
 // truncateToSize truncates the file to newSize bytes.
 //
 // This function handles platform-specific differences in file truncation. On
@@ -182,7 +186,7 @@ func (h *headerFile) truncateToSize(newSize int64) error {
 			return err
 		}
 
-		if err := os.Truncate(fileName, newSize); err != nil {
+		if err := truncatePath(fileName, newSize); err != nil {
 			return err
 		}
 
