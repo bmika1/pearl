@@ -400,6 +400,61 @@ func TestNeutrinoClientNotifyReceivedRestartsAfterRescanExit(t *testing.T) {
 	mu.Unlock()
 }
 
+// TestNeutrinoClientRescanExitSeenAfterRestart pins that the handler watches a rescan started while it was already
+// waiting, so a rescan started after an earlier exit is cleared on its own exit without another notification to wake the
+// handler.
+func TestNeutrinoClientRescanExitSeenAfterRestart(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu         sync.Mutex
+		rescanners []*failingRescanner
+	)
+	nc := &NeutrinoClient{
+		CS: &mockChainService{},
+		newRescan: func(...neutrino.RescanOption) rescanner {
+			mu.Lock()
+			defer mu.Unlock()
+
+			// Unbuffered so that a send completes only while the handler is parked on the channel.
+			r := &failingRescanner{errChan: make(chan error)}
+			rescanners = append(rescanners, r)
+			return r
+		},
+	}
+
+	require.NoError(t, nc.Start(t.Context()))
+	defer func() {
+		nc.Stop()
+		nc.WaitForShutdown()
+	}()
+
+	latestRescanner := func() *failingRescanner {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return rescanners[len(rescanners)-1]
+	}
+
+	for i := range 3 {
+		require.NoError(t, nc.NotifyReceived(nil))
+
+		select {
+		case latestRescanner().errChan <- errors.New("peer disconnected"):
+		case <-time.After(maxDur):
+			t.Fatalf("handler never watched rescan %d", i)
+		}
+
+		// The first check runs one tick after the exit, which leaves the handler parked before the next rescan starts.
+		require.Eventually(t, func() bool {
+			nc.clientMtx.Lock()
+			defer nc.clientMtx.Unlock()
+
+			return !nc.scanning
+		}, maxDur, 10*time.Millisecond, "rescan %d exit did not clear scanning", i)
+	}
+}
+
 // TestNeutrinoClientStaleRescanExitKeepsReplacement pins that the exit of a rescan does not clear the state of the
 // rescan that replaced it while the handler was still waiting to act on the exit.
 func TestNeutrinoClientStaleRescanExitKeepsReplacement(t *testing.T) {
