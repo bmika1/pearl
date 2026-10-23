@@ -42,23 +42,12 @@ func resize(t *testing.T, path string, delta int64) {
 func preloadBlockIndex(t *testing.T, db walletdb.DB, chain []FilterHeader) {
 	t.Helper()
 
-	err := walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
-		rootBucket := tx.ReadWriteBucket(indexBucket)
-		entries := []headerEntry{{hash: *chaincfg.SimNetParams.GenesisHash}}
-		for _, header := range chain {
-			entries = append(entries, headerEntry{
-				hash: header.HeaderHash, height: header.Height,
-			})
-		}
-		for _, entry := range entries {
-			if err := putHeaderEntry(rootBucket, entry); err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
-	require.NoError(t, err)
+	batch := headerBatch{{hash: *chaincfg.SimNetParams.GenesisHash}}
+	for _, header := range chain {
+		batch = append(batch, header.toIndexEntry())
+	}
+	blockIndex := &headerIndex{db: db, indexType: Block}
+	require.NoError(t, blockIndex.addHeaders(batch))
 }
 
 // TestBlockHeaderStoreReconcile reopens block header stores whose file and

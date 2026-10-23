@@ -176,7 +176,6 @@ func (h *headerFile) truncateHeaders(numHeaders uint32,
 // limitations on truncating open files. On other platforms, the file is
 // truncated directly without closing.
 func (h *headerFile) truncateToSize(newSize int64) error {
-	// On Windows, we need to close, truncate, and reopen the file.
 	if runtime.GOOS == "windows" {
 		fileName := h.file.Name()
 		if err := h.file.Close(); err != nil {
@@ -218,7 +217,8 @@ func (h *headerStore) trimPartialRecord() (uint32, error) {
 	if partial := size % int64(headerSize); partial != 0 {
 		size -= partial
 		if err := h.truncateToSize(size); err != nil {
-			return 0, err
+			return 0, corruptErrf("cutting off a partial header: %w",
+				err)
 		}
 	}
 
@@ -358,38 +358,33 @@ func NewBlockHeaderStore(filePath string, db walletdb.DB,
 		return nil, corruptErrf("block header index: %w", err)
 	}
 
-	fileHeight := numHeaders - 1
-	switch {
 	// Headers were appended but not indexed before a crash.
-	case fileHeight > tipHeight:
+	fileHeight := numHeaders - 1
+	if fileHeight > tipHeight {
 		err := bhs.truncateHeaders(fileHeight-tipHeight, bhs.indexType)
 		if err != nil {
-			return nil, err
+			return nil, corruptErrf("truncating block headers: %w", err)
 		}
+		fileHeight = tipHeight
+	}
 
+	latest, err := bhs.readHeader(fileHeight)
+	if err != nil {
+		return nil, corruptErrf("block header %d: %w", fileHeight, err)
+	}
+	latestHash := latest.BlockHash()
+
+	switch {
 	// The file lost data the OS hadn't written yet, while the index
 	// committed, so only the headers that survived can stay indexed.
 	case fileHeight < tipHeight:
-		latest, err := bhs.readHeader(fileHeight)
-		if err != nil {
-			return nil, corruptErrf("block header %d: %w", fileHeight,
-				err)
-		}
-		latestHash := latest.BlockHash()
 		if err := bhs.rollbackIndex(&latestHash, fileHeight); err != nil {
 			return nil, err
 		}
 
-		return bhs, nil
-	}
-
-	latest, err := bhs.readHeader(tipHeight)
-	if err != nil {
-		return nil, corruptErrf("block header %d: %w", tipHeight, err)
-	}
-	if latestHash := latest.BlockHash(); !tipHash.IsEqual(&latestHash) {
+	case !tipHash.IsEqual(&latestHash):
 		return nil, corruptErrf("block header %d is not the index tip "+
-			"%v", tipHeight, tipHash)
+			"%v", fileHeight, tipHash)
 	}
 
 	return bhs, nil
@@ -615,14 +610,6 @@ func (h *blockHeaderStore) WriteHeaders(hdrs ...BlockHeader) error {
 	// both the initial operation and the rollback fail, we return
 	// a detailed error explaining both failures to aid in debugging.
 	if err := h.addHeaders(headerLocs); err != nil {
-		// Since the probability of failing to write to the database is
-		// very low, it is mostly worth the cost of file sync operation
-		// to make sure truncate headers does it correctly.
-		if err := h.file.Sync(); err != nil {
-			return fmt.Errorf("failed to sync block headers "+
-				"file: %v", err)
-		}
-
 		headersToRollback := len(hdrs)
 		truncateErr := h.truncateHeaders(
 			uint32(headersToRollback), h.indexType,
@@ -891,9 +878,6 @@ func NewFilterHeaderStore(filePath string, db walletdb.DB,
 		return nil, err
 	}
 
-	// TODO(roasbeef): also reconsile with block header state due to way
-	// roll back works atm
-
 	// If the file holds no header, then this means that we haven't yet
 	// written the initial genesis header to disk, so we'll do so now.
 	if numHeaders == 0 {
@@ -986,7 +970,7 @@ func NewFilterHeaderStore(filePath string, db walletdb.DB,
 	if fileHeight > tipHeight {
 		err := fhs.truncateHeaders(fileHeight-tipHeight, fhs.indexType)
 		if err != nil {
-			return nil, err
+			return nil, corruptErrf("truncating filter headers: %w", err)
 		}
 	}
 
@@ -1163,14 +1147,6 @@ func (f *filterHeaderStore) WriteHeaders(hdrs ...FilterHeader) error {
 	// both the initial operation and the rollback fail, we return
 	// a detailed error explaining both failures to aid in debugging.
 	if err := f.truncateIndices(&newTip, nil, false); err != nil {
-		// Since the probability of failing to write to the database is
-		// very low, it is mostly worth the cost of file sync operation
-		// to make sure truncate headers does it correctly.
-		if err := f.file.Sync(); err != nil {
-			return fmt.Errorf("failed to sync filter headers "+
-				"file: %v", err)
-		}
-
 		headersToRollback := len(hdrs)
 		truncateErr := f.truncateHeaders(
 			uint32(headersToRollback), f.indexType,
