@@ -441,7 +441,7 @@ class WalletProcess {
     // the RPC port.
     const proc = this.process;
     if (!proc) {
-      return { success: false as const, message: 'Wallet is not running' };
+      return;
     }
 
     const stopTimeoutMs = options.force ? FORCE_STOP_TIMEOUT_MS : STOP_TIMEOUT_MS;
@@ -453,10 +453,8 @@ class WalletProcess {
       skipTerminate: options.force,
     });
     if (!exited) {
-      return { success: false as const, message: 'Wallet process did not exit' };
+      console.warn(`Wallet process ${proc.pid} did not exit`);
     }
-
-    return { success: true as const, message: options.force ? 'Wallet force stopped' : 'Wallet stopped successfully' };
   }
 
   async killExistingWalletProcesses() {
