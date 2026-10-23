@@ -103,6 +103,9 @@ type rescanOptions struct {
 	watchList   [][]byte
 	txIdx       uint32
 
+	// reorgedTip is set when this rescan resumes an exited one whose last notified block has left the best chain.
+	reorgedTip *reorgedTip
+
 	update <-chan *updateOptions
 	quit   <-chan struct{}
 }
@@ -517,6 +520,21 @@ func (rs *rescanState) rescan() error {
 	// the tip of the chain.
 	current := false
 
+	// The caller still holds the reorged block and learns it is gone only from this notification, which must come
+	// before the blocks that replaced it.
+	if tip := ro.reorgedTip; tip != nil {
+		if ro.ntfn.OnBlockDisconnected != nil { // nolint:staticcheck
+			ro.ntfn.OnBlockDisconnected( // nolint:staticcheck
+				&tip.stamp.Hash, tip.stamp.Height, tip.header.Timestamp,
+			)
+		}
+		if ro.ntfn.OnFilteredBlockDisconnected != nil {
+			ro.ntfn.OnFilteredBlockDisconnected(
+				tip.stamp.Height, &tip.header,
+			)
+		}
+	}
+
 	// Loop through blocks, one at a time. This relies on the underlying
 	// chain source to deliver notifications in the correct order.
 rescanLoop:
@@ -812,16 +830,51 @@ func (rs *rescanState) waitForRetry(interval time.Duration) error {
 	}
 }
 
-// resumeOption captures what a replacement rescan needs to continue from where this one stopped. The watch lists grow
-// while the rescan runs, with updates and with the outputs it matches, so the options it was created with are stale.
-func (rs *rescanState) resumeOption() RescanOption {
-	addrs := slices.Clone(rs.opts.watchAddrs)
-	inputs := slices.Clone(rs.opts.watchInputs)
-	start := rs.curStamp
+// resumeOverlap is how many blocks before the last one notified a resumed rescan starts when that block has left the
+// best chain, so that the blocks which replaced it are notified. A reorg deeper than this is not repaired.
+const resumeOverlap = 6
+
+// reorgedTip is a block a rescan notified that has since left the best chain.
+type reorgedTip struct {
+	stamp  headerfs.BlockStamp
+	header wire.BlockHeader
+}
+
+// resumeState is what a replacement rescan needs to continue from where an exited one stopped. The watch lists grow
+// while a rescan runs, with updates and with the outputs it matches, so the options it was created with are stale.
+type resumeState struct {
+	watchAddrs  []btcutil.Address
+	watchInputs []InputWithScript
+	lastBlock   headerfs.BlockStamp
+	lastHeader  wire.BlockHeader
+}
+
+// captureResume records the state a replacement rescan resumes from.
+func (rs *rescanState) captureResume() *resumeState {
+	return &resumeState{
+		watchAddrs:  slices.Clone(rs.opts.watchAddrs),
+		watchInputs: slices.Clone(rs.opts.watchInputs),
+		lastBlock:   rs.curStamp,
+		lastHeader:  rs.curHeader,
+	}
+}
+
+// option returns the rescan option that applies the state. The block a rescan last notified can be reorged out while
+// the rescan is down, without its caller hearing of it, so a last block that has left the best chain is reported as
+// disconnected and the start moves back to where the blocks that replaced it are notified.
+func (s *resumeState) option(chain ChainSource) RescanOption {
+	start := s.lastBlock
+
+	var reorged *reorgedTip
+	if _, _, err := chain.GetBlockHeader(&start.Hash); err != nil {
+		reorged = &reorgedTip{stamp: s.lastBlock, header: s.lastHeader}
+		start = headerfs.BlockStamp{Height: max(start.Height-resumeOverlap, 0)}
+	}
 
 	return func(ro *rescanOptions) {
-		ro.watchAddrs = slices.Clone(addrs)
-		ro.watchInputs = slices.Clone(inputs)
+		ro.watchAddrs = slices.Clone(s.watchAddrs)
+		ro.watchInputs = slices.Clone(s.watchInputs)
+		ro.reorgedTip = reorged
 
 		startBlock := start
 		ro.startBlock = &startBlock
@@ -1423,7 +1476,7 @@ type Rescan struct { // nolint:maligned
 
 	errMtx sync.Mutex
 	err    error
-	resume RescanOption
+	resume *resumeState
 
 	wg sync.WaitGroup
 }
@@ -1471,7 +1524,7 @@ func (r *Rescan) Start() <-chan error {
 		r.errMtx.Lock()
 		r.err = err
 		if rs != nil {
-			r.resume = rs.resumeOption()
+			r.resume = rs.captureResume()
 		}
 		r.errMtx.Unlock()
 
@@ -1485,9 +1538,10 @@ func (r *Rescan) Start() <-chan error {
 
 // ResumeOptions returns the options for a new rescan that continues where this one exited. The new rescan watches every
 // address and input this one did, including the outputs it matched along the way, and starts at the last block this
-// one notified. The options include those this rescan was created with, so a caller replaces one of them, such as
-// QuitChan, by appending its own. It returns nil while the rescan is running, and if it exited before it started
-// scanning.
+// one notified, or a few blocks earlier if that block has since left the best chain, in which case blocks the caller
+// already has are notified again. The options include those this rescan was created with, so a caller replaces one of
+// them, such as QuitChan, by appending its own. It returns nil while the rescan is running, and if it exited before it
+// started scanning.
 func (r *Rescan) ResumeOptions() []RescanOption {
 	select {
 	case <-r.running:
@@ -1496,13 +1550,14 @@ func (r *Rescan) ResumeOptions() []RescanOption {
 	}
 
 	r.errMtx.Lock()
-	defer r.errMtx.Unlock()
+	resume := r.resume
+	r.errMtx.Unlock()
 
-	if r.resume == nil {
+	if resume == nil {
 		return nil
 	}
 
-	return append(slices.Clone(r.options), r.resume)
+	return append(slices.Clone(r.options), resume.option(r.chain))
 }
 
 // updateOptions are a set of functional parameters for Update.

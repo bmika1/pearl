@@ -212,6 +212,20 @@ func (c *mockChainSource) rollbackToHeight(height int32, notify bool) {
 	}
 }
 
+// blockStampAt returns the stamp of the block at the given height of the current chain.
+func (c *mockChainSource) blockStampAt(height int32) headerfs.BlockStamp {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	hash := c.blockHashesByHeight[uint32(height)]
+
+	return headerfs.BlockStamp{
+		Hash:      *hash,
+		Height:    height,
+		Timestamp: c.blockHeaders[*hash].Timestamp,
+	}
+}
+
 // ChainParams returns the parameters of the current chain.
 func (c *mockChainSource) ChainParams() chaincfg.Params {
 	return chaincfg.MainNetParams
@@ -529,6 +543,20 @@ func (ctx *rescanTestContext) recvBlockConnected(block headerfs.BlockStamp) {
 	}
 }
 
+// recvBlockDisconnected is a helper method used to expect a block disconnected
+// notification being delivered.
+func (ctx *rescanTestContext) recvBlockDisconnected(block headerfs.BlockStamp) {
+	ctx.t.Helper()
+
+	select {
+	case recvBlock := <-ctx.blocksDisconnected:
+		require.Equal(ctx.t, block, recvBlock)
+	case <-time.After(time.Second):
+		ctx.t.Fatalf("expected to receive block disconnected "+
+			"notification for %v", spew.Sdump(block))
+	}
+}
+
 // assertFilterQueried asserts that a filter for the given block hash was
 // queried for.
 func (ctx *rescanTestContext) assertFilterQueried(hash chainhash.Hash) {
@@ -617,6 +645,61 @@ func (ctx *rescanTestContext) recvBlockConnectedAfterRetries(
 		case <-timeout:
 			ctx.t.Fatalf("expected to receive block connected notification for %v", spew.Sdump(block))
 		}
+	}
+}
+
+// exitOnCanceledSubscription ends the running rescan with an error it cannot recover from by itself.
+func (ctx *rescanTestContext) exitOnCanceledSubscription() {
+	ctx.t.Helper()
+
+	close(ctx.chain.ntfnChan)
+
+	select {
+	case err := <-ctx.errChan:
+		require.ErrorContains(ctx.t, err, "block subscription was canceled")
+	case <-time.After(time.Second):
+		ctx.t.Fatal("expected rescan to exit when its block subscription is canceled")
+	}
+}
+
+// resume replaces the exited rescan with one built from its resume options. The returned channel signals once the new
+// rescan has caught up and subscribed, which is when block notifications start being read.
+func (ctx *rescanTestContext) resume() <-chan struct{} {
+	ctx.t.Helper()
+
+	resumeOptions := ctx.rescan.ResumeOptions()
+	require.NotNil(ctx.t, resumeOptions)
+
+	ctx.chain.mu.Lock()
+	ctx.chain.ntfnChan = make(chan blockntfns.BlockNtfn)
+	ctx.chain.mu.Unlock()
+
+	subscribed := make(chan struct{}, 1)
+	ctx.chain.overrideSubscribe(func(uint32) (*blockntfns.Subscription, error) {
+		select {
+		case subscribed <- struct{}{}:
+		default:
+		}
+
+		return &blockntfns.Subscription{
+			Notifications: ctx.chain.ntfnChan,
+			Cancel:        func() {},
+		}, nil
+	})
+
+	ctx.rescan = NewRescan(ctx.chain, resumeOptions...)
+	ctx.errChan = ctx.rescan.Start()
+
+	return subscribed
+}
+
+func (ctx *rescanTestContext) assertSubscribed(subscribed <-chan struct{}) {
+	ctx.t.Helper()
+
+	select {
+	case <-subscribed:
+	case <-time.After(time.Second):
+		ctx.t.Fatal("expected the resumed rescan to catch up and subscribe")
 	}
 }
 
@@ -938,13 +1021,17 @@ func testTaprootAddr(t *testing.T, seed byte) btcutil.Address {
 func TestRescanStateResumeOption(t *testing.T) {
 	t.Parallel()
 
+	chain := newMockChainSource(10)
+	lastBlock, err := chain.BestBlock()
+	require.NoError(t, err)
+
 	watched := testTaprootAddr(t, 1)
 	watchedScript, err := txscript.PayToAddrScript(watched)
 	require.NoError(t, err)
 
 	rs := &rescanState{
 		opts:     &rescanOptions{watchAddrs: []btcutil.Address{watched}},
-		curStamp: headerfs.BlockStamp{Height: 7, Hash: chainhash.Hash{7}},
+		curStamp: *lastBlock,
 	}
 
 	tx := wire.NewMsgTx(wire.TxVersion)
@@ -953,7 +1040,7 @@ func TestRescanStateResumeOption(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, matched)
 
-	resume := rs.resumeOption()
+	resume := rs.captureResume().option(chain)
 
 	restored := &rescanOptions{}
 	resume(restored)
@@ -963,16 +1050,51 @@ func TestRescanStateResumeOption(t *testing.T) {
 		OutPoint: wire.OutPoint{Hash: tx.TxHash()},
 		PkScript: watchedScript,
 	}}, restored.watchInputs)
-	require.Equal(t,
-		&headerfs.BlockStamp{Height: 7, Hash: chainhash.Hash{7}},
-		restored.startBlock,
-	)
+	require.Equal(t, lastBlock, restored.startBlock)
+	require.Nil(t, restored.reorgedTip)
 
 	// Each application gets its own copy, so a rescan's updates never reach another.
 	other := &rescanOptions{}
 	resume(other)
 	restored.watchAddrs[0] = nil
 	require.Equal(t, []btcutil.Address{watched}, other.watchAddrs)
+}
+
+// TestRescanStateResumeOptionStartsBeforeReorgedBlock pins that a last block which has left the best chain is marked
+// to be reported as disconnected and moves the start back, by height since its hash no longer resolves, and never
+// below the genesis block.
+func TestRescanStateResumeOptionStartsBeforeReorgedBlock(t *testing.T) {
+	t.Parallel()
+
+	chain := newMockChainSource(10)
+	reorged := chainhash.Hash{9}
+
+	for _, tt := range []struct {
+		name        string
+		height      int32
+		wantStartAt int32
+	}{
+		{"above the overlap", 8, 8 - resumeOverlap},
+		{"within the overlap of genesis", 2, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rs := &rescanState{
+				opts:     &rescanOptions{},
+				curStamp: headerfs.BlockStamp{Height: tt.height, Hash: reorged},
+			}
+
+			restored := &rescanOptions{}
+			rs.captureResume().option(chain)(restored)
+
+			require.Equal(t,
+				&headerfs.BlockStamp{Height: tt.wantStartAt}, restored.startBlock,
+			)
+			require.NotNil(t, restored.reorgedTip)
+			require.Equal(t, rs.curStamp, restored.reorgedTip.stamp)
+		})
+	}
 }
 
 // TestRescanResumeAfterExit pins that a rescan built from ResumeOptions starts at the block after the last one the
@@ -992,54 +1114,61 @@ func TestRescanResumeAfterExit(t *testing.T) {
 	ctx.assertFilterQueried(block1.Hash)
 	ctx.recvBlockConnected(block1)
 
-	// The rescan cannot recover from a canceled block subscription, so it exits.
-	close(ctx.chain.ntfnChan)
-	select {
-	case err := <-ctx.errChan:
-		require.ErrorContains(t, err, "block subscription was canceled")
-	case <-time.After(time.Second):
-		t.Fatal("expected rescan to exit when its block subscription is canceled")
-	}
+	ctx.exitOnCanceledSubscription()
 
 	block2 := ctx.chain.addNewBlock(false)
 
-	resumeOptions := ctx.rescan.ResumeOptions()
-	require.NotNil(t, resumeOptions)
-
-	ctx.chain.mu.Lock()
-	ctx.chain.ntfnChan = make(chan blockntfns.BlockNtfn)
-	ctx.chain.mu.Unlock()
-
-	// Block notifications are only read once the rescan has caught up and subscribed.
-	subscribed := make(chan struct{}, 1)
-	ctx.chain.overrideSubscribe(func(uint32) (*blockntfns.Subscription, error) {
-		select {
-		case subscribed <- struct{}{}:
-		default:
-		}
-
-		return &blockntfns.Subscription{
-			Notifications: ctx.chain.ntfnChan,
-			Cancel:        func() {},
-		}, nil
-	})
-
-	ctx.rescan = NewRescan(ctx.chain, resumeOptions...)
-	ctx.errChan = ctx.rescan.Start()
+	subscribed := ctx.resume()
 	defer ctx.stop()
 
 	ctx.assertFilterQueried(block2.Hash)
 	ctx.recvBlockConnected(block2)
 
-	select {
-	case <-subscribed:
-	case <-time.After(time.Second):
-		t.Fatal("expected the resumed rescan to catch up and subscribe")
-	}
+	// Block notifications are only read once the rescan has caught up and subscribed.
+	ctx.assertSubscribed(subscribed)
 
 	block3 := ctx.chain.addNewBlock(true)
 	ctx.assertFilterQueried(block3.Hash)
 	ctx.recvBlockConnected(block3)
+}
+
+// TestRescanResumeAfterReorgWhileExited pins that a rescan resumed after the block it last notified was replaced
+// reports that block as disconnected and starts before it, so the blocks which replaced it are notified.
+func TestRescanResumeAfterReorgWhileExited(t *testing.T) {
+	t.Parallel()
+
+	ctx := newRescanTestContext(t, 10,
+		StartTime(time.Time{}),
+		WatchInputs(InputWithScript{PkScript: testWatchScript}),
+	)
+	ctx.start(true)
+
+	block := ctx.chain.addNewBlock(true)
+	ctx.assertFilterQueried(block.Hash)
+	ctx.recvBlockConnected(block)
+
+	ctx.exitOnCanceledSubscription()
+
+	forkPoint := ctx.chain.rollback(false)
+	replacement := ctx.chain.addNewBlockWithHeader(
+		&wire.BlockHeader{PrevBlock: forkPoint.Hash}, false,
+	)
+	require.NotEqual(t, block.Hash, replacement.Hash)
+	next := ctx.chain.addNewBlock(false)
+
+	subscribed := ctx.resume()
+	defer ctx.stop()
+
+	ctx.recvBlockDisconnected(block)
+
+	// The blocks before the replaced one are notified again, then the replacement and the block after it.
+	for height := block.Height - resumeOverlap + 1; height <= next.Height; height++ {
+		stamp := ctx.chain.blockStampAt(height)
+		ctx.assertFilterQueried(stamp.Hash)
+		ctx.recvBlockConnected(stamp)
+	}
+
+	ctx.assertSubscribed(subscribed)
 }
 
 // TestRescanResumeOptionsAfterFailedCatchUpBlock pins that a rescan which exits on a block it could not notify resumes
