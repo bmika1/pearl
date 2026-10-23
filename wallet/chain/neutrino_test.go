@@ -340,6 +340,8 @@ func TestNeutrinoClientBlockStampTracksChainService(t *testing.T) {
 	require.ErrorContains(t, err, "disconnected")
 }
 
+// failingRescanner is a rescanner that exits when a test sends an error on errChan. Update fails once done is set, as it
+// does on a finished neutrino.Rescan, and ResumeOptions returns resume.
 type failingRescanner struct {
 	errChan chan error
 	done    bool
@@ -363,147 +365,19 @@ func (f *failingRescanner) ResumeOptions() []neutrino.RescanOption {
 	return f.resume
 }
 
+// TestNeutrinoClientNotifyReceivedRestartsAfterRescanExit pins that the handler clears a rescan that exited, including
+// one started after an earlier exit, so that NotifyReceived starts another rescan instead of updating the finished one.
 func TestNeutrinoClientNotifyReceivedRestartsAfterRescanExit(t *testing.T) {
 	t.Parallel()
 
-	var (
-		mu         sync.Mutex
-		rescanners []*failingRescanner
-	)
+	var rescanners []*failingRescanner
 	nc := &NeutrinoClient{
 		CS: &mockChainService{},
 		newRescan: func(...neutrino.RescanOption) rescanner {
-			mu.Lock()
-			defer mu.Unlock()
-			r := &failingRescanner{errChan: make(chan error, 1)}
-			rescanners = append(rescanners, r)
-			return r
-		},
-	}
-
-	require.NoError(t, nc.Start(t.Context()))
-	defer func() {
-		nc.Stop()
-		nc.WaitForShutdown()
-	}()
-
-	require.NoError(t, nc.NotifyReceived(nil))
-	require.Len(t, rescanners, 1)
-
-	rescanners[0].done = true
-	rescanners[0].errChan <- errors.New("peer disconnected")
-
-	require.Eventually(t, func() bool {
-		nc.clientMtx.Lock()
-		defer nc.clientMtx.Unlock()
-		return !nc.scanning
-	}, maxDur, 10*time.Millisecond)
-
-	require.NoError(t, nc.NotifyReceived(nil))
-	mu.Lock()
-	assert.Len(t, rescanners, 2)
-	mu.Unlock()
-}
-
-// TestNeutrinoClientNotifyReceivedResumesExitedRescan pins that NotifyReceived continues a rescan that exited instead
-// of starting one that watches only its own addresses, and that a resumed initial sync keeps owing RescanFinished.
-func TestNeutrinoClientNotifyReceivedResumesExitedRescan(t *testing.T) {
-	t.Parallel()
-
-	var (
-		mu          sync.Mutex
-		rescanners  []*failingRescanner
-		optionCount []int
-	)
-	nc := &NeutrinoClient{
-		CS: &mockChainService{},
-		newRescan: func(opts ...neutrino.RescanOption) rescanner {
-			mu.Lock()
-			defer mu.Unlock()
-
-			r := &failingRescanner{errChan: make(chan error, 1)}
-			rescanners = append(rescanners, r)
-			optionCount = append(optionCount, len(opts))
-			return r
-		},
-	}
-
-	require.NoError(t, nc.Start(t.Context()))
-	defer func() {
-		nc.Stop()
-		nc.WaitForShutdown()
-	}()
-
-	exitLatestRescan := func(resume []neutrino.RescanOption) {
-		mu.Lock()
-		r := rescanners[len(rescanners)-1]
-		mu.Unlock()
-
-		r.resume = resume
-		r.errChan <- errors.New("peer disconnected")
-
-		require.Eventually(t, func() bool {
-			nc.clientMtx.Lock()
-			defer nc.clientMtx.Unlock()
-
-			return !nc.scanning
-		}, maxDur, 10*time.Millisecond)
-	}
-
-	finished := func() bool {
-		nc.clientMtx.Lock()
-		defer nc.clientMtx.Unlock()
-
-		return nc.finished
-	}
-
-	require.NoError(t, nc.NotifyReceived(nil))
-	require.True(t, finished())
-
-	nc.clientMtx.Lock()
-	nc.finished = false
-	nc.clientMtx.Unlock()
-
-	resume := []neutrino.RescanOption{
-		neutrino.StartBlock(&headerfs.BlockStamp{Height: 5}),
-		neutrino.WatchAddrs(),
-	}
-	exitLatestRescan(resume)
-
-	require.NoError(t, nc.NotifyReceived(nil))
-	require.False(t, finished(), "a resumed rescan keeps the state of the one it continues")
-
-	exitLatestRescan(nil)
-
-	require.NoError(t, nc.NotifyReceived(nil))
-	require.True(t, finished(), "a rescan that cannot be resumed starts fresh")
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	// A fresh start passes four options; resuming prepends the options of the exited rescan.
-	assert.Equal(t, []int{4, 4 + len(resume), 4}, optionCount)
-}
-
-// TestNeutrinoClientRescanExitSeenAfterRestart pins that the handler watches a rescan started while it was already
-// waiting, so a rescan started after an earlier exit is cleared on its own exit without another notification to wake the
-// handler.
-func TestNeutrinoClientRescanExitSeenAfterRestart(t *testing.T) {
-	t.Parallel()
-
-	var (
-		mu         sync.Mutex
-		rescanners []*failingRescanner
-	)
-	nc := &NeutrinoClient{
-		CS: &mockChainService{},
-		newRescan: func(...neutrino.RescanOption) rescanner {
-			mu.Lock()
-			defer mu.Unlock()
-
 			// Unbuffered so that a send completes only while the handler is parked on the channel.
 			r := &failingRescanner{errChan: make(chan error)}
 			rescanners = append(rescanners, r)
+
 			return r
 		},
 	}
@@ -514,21 +388,19 @@ func TestNeutrinoClientRescanExitSeenAfterRestart(t *testing.T) {
 		nc.WaitForShutdown()
 	}()
 
-	latestRescanner := func() *failingRescanner {
-		mu.Lock()
-		defer mu.Unlock()
-
-		return rescanners[len(rescanners)-1]
-	}
-
 	for i := range 3 {
 		require.NoError(t, nc.NotifyReceived(nil))
+		require.Len(t, rescanners, i+1)
 
-		select {
-		case latestRescanner().errChan <- errors.New("peer disconnected"):
-		case <-time.After(maxDur):
-			t.Fatalf("handler never watched rescan %d", i)
-		}
+		rescanners[i].done = true
+		require.Eventually(t, func() bool {
+			select {
+			case rescanners[i].errChan <- errors.New("peer disconnected"):
+				return true
+			default:
+				return false
+			}
+		}, maxDur, time.Millisecond, "handler never watched rescan %d", i)
 
 		// The first check runs one tick after the exit, which leaves the handler parked before the next rescan starts.
 		require.Eventually(t, func() bool {
@@ -538,6 +410,40 @@ func TestNeutrinoClientRescanExitSeenAfterRestart(t *testing.T) {
 			return !nc.scanning
 		}, maxDur, 10*time.Millisecond, "rescan %d exit did not clear scanning", i)
 	}
+}
+
+// TestNeutrinoClientNotifyReceivedResumesExitedRescan pins that NotifyReceived continues a rescan that exited when it
+// can be resumed, passing the options of the exited rescan ahead of its own, and leaves the state of an unfinished
+// initial sync alone so that it still reports RescanFinished.
+func TestNeutrinoClientNotifyReceivedResumesExitedRescan(t *testing.T) {
+	t.Parallel()
+
+	// notify has NotifyReceived start a rescan after the exited one. It returns how many options that rescan was created
+	// with, and whether the client then counts the initial sync as finished.
+	notify := func(exited *failingRescanner) (int, bool) {
+		var options int
+		nc := &NeutrinoClient{
+			CS:     &mockChainService{},
+			rescan: exited,
+			newRescan: func(opts ...neutrino.RescanOption) rescanner {
+				options = len(opts)
+
+				return &failingRescanner{}
+			},
+		}
+		require.NoError(t, nc.NotifyReceived(nil))
+
+		return options, nc.finished
+	}
+
+	freshOptions, freshFinished := notify(&failingRescanner{})
+
+	resume := []neutrino.RescanOption{neutrino.StartBlock(&headerfs.BlockStamp{Height: 5})}
+	resumedOptions, resumedFinished := notify(&failingRescanner{resume: resume})
+
+	assert.Equal(t, freshOptions+len(resume), resumedOptions)
+	assert.True(t, freshFinished)
+	assert.False(t, resumedFinished, "a resumed rescan keeps the state of the one it continues")
 }
 
 // TestNeutrinoClientStaleRescanExitKeepsReplacement pins that the exit of a rescan does not clear the state of the
