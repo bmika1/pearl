@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -22,10 +23,7 @@ func testChainServiceConfig(t *testing.T) Config {
 	t.Helper()
 
 	dir := t.TempDir()
-	db, err := walletdb.Create(
-		"bdb", filepath.Join(dir, "neutrino.db"), true, 10*time.Second,
-		false,
-	)
+	db, err := walletdb.Create("bdb", filepath.Join(dir, "neutrino.db"), true, 10*time.Second, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, db.Close()) })
 
@@ -37,9 +35,7 @@ func openHeaderFiles(t *testing.T, dir string) []string {
 	t.Helper()
 
 	fds, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		t.Skip("needs /proc to list open files")
-	}
+	require.NoError(t, err)
 
 	var open []string
 	for _, fd := range fds {
@@ -52,10 +48,12 @@ func openHeaderFiles(t *testing.T, dir string) []string {
 	return open
 }
 
-// TestChainServiceReleasesHeaderFiles makes sure the header files are closed
-// when the service stops or fails to start, as open files can't be moved aside
-// on Windows.
+// TestChainServiceReleasesHeaderFiles makes sure the header files are closed when the service stops or fails to start,
+// as open files can't be moved aside on Windows.
 func TestChainServiceReleasesHeaderFiles(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("open files are listed through /proc")
+	}
 	cfg := testChainServiceConfig(t)
 
 	cs, err := NewChainService(cfg)
@@ -65,12 +63,9 @@ func TestChainServiceReleasesHeaderFiles(t *testing.T) {
 	require.NoError(t, cs.Stop())
 	require.Empty(t, openHeaderFiles(t, cfg.DataDir))
 
-	// The filter headers fail to open once their tip is gone, after the
-	// block headers were opened.
+	// The filter headers fail to open once their tip is gone, after the block headers were opened.
 	err = walletdb.Update(cfg.Database, func(tx walletdb.ReadWriteTx) error {
-		return tx.ReadWriteBucket([]byte("header-index")).Delete(
-			[]byte("regular"),
-		)
+		return tx.ReadWriteBucket([]byte("header-index")).Delete([]byte("regular"))
 	})
 	require.NoError(t, err)
 
@@ -79,8 +74,8 @@ func TestChainServiceReleasesHeaderFiles(t *testing.T) {
 	require.Empty(t, openHeaderFiles(t, cfg.DataDir))
 }
 
-// TestChainServiceStartsWithShortHeaderFiles covers header files that lost
-// their tails, by different amounts, while the database kept the full chain.
+// TestChainServiceStartsWithShortHeaderFiles covers header files that lost their tails, by different amounts, while the
+// database kept the full chain.
 func TestChainServiceStartsWithShortHeaderFiles(t *testing.T) {
 	const (
 		numHeaders = 10
@@ -88,13 +83,10 @@ func TestChainServiceStartsWithShortHeaderFiles(t *testing.T) {
 	)
 	cfg := testChainServiceConfig(t)
 
-	blockStore, err := headerfs.NewBlockHeaderStore(
-		cfg.DataDir, cfg.Database, &cfg.ChainParams,
-	)
+	blockStore, err := headerfs.NewBlockHeaderStore(cfg.DataDir, cfg.Database, &cfg.ChainParams)
 	require.NoError(t, err)
 	filterStore, err := headerfs.NewFilterHeaderStore(
-		cfg.DataDir, cfg.Database, headerfs.RegularFilter,
-		&cfg.ChainParams, nil,
+		cfg.DataDir, cfg.Database, headerfs.RegularFilter, &cfg.ChainParams, nil,
 	)
 	require.NoError(t, err)
 
@@ -104,14 +96,8 @@ func TestChainServiceStartsWithShortHeaderFiles(t *testing.T) {
 		filters []headerfs.FilterHeader
 	)
 	for i := uint32(1); i <= numHeaders; i++ {
-		header := &wire.BlockHeader{
-			Bits:      i,
-			Timestamp: prev.Timestamp.Add(time.Minute),
-			PrevBlock: prev.BlockHash(),
-		}
-		blocks = append(blocks, headerfs.BlockHeader{
-			BlockHeader: header, Height: i,
-		})
+		header := &wire.BlockHeader{Bits: i, Timestamp: prev.Timestamp.Add(time.Minute), PrevBlock: prev.BlockHash()}
+		blocks = append(blocks, headerfs.BlockHeader{BlockHeader: header, Height: i})
 		filters = append(filters, headerfs.FilterHeader{
 			HeaderHash: header.BlockHash(),
 			FilterHash: chainhash.HashH(header.PrevBlock[:]),

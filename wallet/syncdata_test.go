@@ -8,6 +8,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 	"time"
@@ -21,8 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// useTestChain points the global config at a simnet SPV wallet and returns its
-// network directory.
+// useTestChain points the global config at a simnet SPV wallet and returns its network directory.
 func useTestChain(t *testing.T, dbTimeout time.Duration) string {
 	t.Helper()
 
@@ -63,21 +63,20 @@ func readFile(t *testing.T, path string) string {
 	return string(content)
 }
 
-// openSyncFiles lists the chain sync files in dir this process holds open.
+// openSyncFiles lists the chain sync files in dir this process holds open. Only Linux lists them, through /proc.
 func openSyncFiles(t *testing.T, dir string) []string {
 	t.Helper()
 
-	fds, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		t.Skip("needs /proc to list open files")
+	if runtime.GOOS != "linux" {
+		return nil
 	}
+	fds, err := os.ReadDir("/proc/self/fd")
+	require.NoError(t, err)
 
 	var open []string
 	for _, fd := range fds {
 		target, _ := os.Readlink(filepath.Join("/proc/self/fd", fd.Name()))
-		if filepath.Dir(target) == dir &&
-			slices.Contains(syncDataFiles, filepath.Base(target)) {
-
+		if filepath.Dir(target) == dir && slices.Contains(syncDataFiles, filepath.Base(target)) {
 			open = append(open, filepath.Base(target))
 		}
 	}
@@ -141,9 +140,8 @@ func TestResetSyncData(t *testing.T) {
 	require.Len(t, entries, len(files))
 }
 
-// TestConnectLoopResetsCorruptSyncData runs the connect loop on header files
-// without the database that indexes them: the chain sync data is moved aside
-// and the chain service starts over.
+// TestConnectLoopResetsCorruptSyncData runs the connect loop on header files without the database that indexes them:
+// the chain sync data is moved aside and the chain service starts over.
 func TestConnectLoopResetsCorruptSyncData(t *testing.T) {
 	netDir := useTestChain(t, 5*time.Second)
 	headers := string(make([]byte, 5*headerfs.BlockHeaderSize))
@@ -171,9 +169,8 @@ func TestConnectLoopResetsCorruptSyncData(t *testing.T) {
 	require.Empty(t, openSyncFiles(t, netDir))
 }
 
-// TestConnectLoopReconnectsAfterClientStops makes sure a chain client that goes
-// away is replaced by one on the same database, which only works if the
-// previous attempt let go of it.
+// TestConnectLoopReconnectsAfterClientStops makes sure a chain client that goes away is replaced by one on the same
+// database, which only works if the previous attempt let go of it.
 func TestConnectLoopReconnectsAfterClientStops(t *testing.T) {
 	netDir := useTestChain(t, 3*time.Second)
 
@@ -203,8 +200,7 @@ func TestConnectLoopReconnectsAfterClientStops(t *testing.T) {
 	require.Empty(t, openSyncFiles(t, netDir))
 }
 
-// TestConnectLoopStopsWhileRetrying makes sure shutdown doesn't wait out the
-// delay before the next attempt.
+// TestConnectLoopStopsWhileRetrying makes sure shutdown doesn't wait out the delay before the next attempt.
 func TestConnectLoopStopsWhileRetrying(t *testing.T) {
 	netDir := useTestChain(t, 50*time.Millisecond)
 
@@ -213,10 +209,7 @@ func TestConnectLoopStopsWhileRetrying(t *testing.T) {
 	t.Cleanup(func() { chainClientRetryMin, chainClientRetryMax = prevMin, prevMax })
 
 	// Every attempt times out on a database held by someone else.
-	held, err := walletdb.Create(
-		"bdb", filepath.Join(netDir, neutrinoDBName), true, time.Second,
-		false,
-	)
+	held, err := walletdb.Create("bdb", filepath.Join(netDir, neutrinoDBName), true, time.Second, false)
 	require.NoError(t, err)
 	defer held.Close()
 

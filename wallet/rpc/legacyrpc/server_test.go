@@ -191,9 +191,8 @@ func TestPostHandshakeAuth(t *testing.T) {
 	assert.Equal(t, http.StatusOK, post("user", "pass", true))
 }
 
-// TestStopRequestsProcessShutdown checks that a stop request asks the process to
-// shut down, which the desktop wallet relies on to exit oyster without killing
-// it.
+// TestStopRequestsProcessShutdown checks that a stop request asks the process to shut down, which the desktop wallet
+// relies on to exit oyster without killing it.
 func TestStopRequestsProcessShutdown(t *testing.T) {
 	t.Parallel()
 
@@ -210,9 +209,8 @@ func TestStopRequestsProcessShutdown(t *testing.T) {
 	srv.Start()
 	defer srv.Stop()
 
-	req, err := http.NewRequest(http.MethodPost,
-		"http://"+lis.Addr().String()+"/",
-		strings.NewReader(`{"jsonrpc":"1.0","id":1,"method":"stop"}`))
+	body := strings.NewReader(`{"jsonrpc":"1.0","id":1,"method":"stop"}`)
+	req, err := http.NewRequest(http.MethodPost, "http://"+lis.Addr().String()+"/", body)
 	require.NoError(t, err)
 	req.SetBasicAuth("user", "pass")
 	resp, err := http.DefaultClient.Do(req)
