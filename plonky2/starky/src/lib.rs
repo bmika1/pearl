@@ -215,7 +215,6 @@
 extern crate alloc;
 
 mod get_challenges;
-mod poc_par;
 
 pub mod batch_proof;
 pub mod batch_prover;

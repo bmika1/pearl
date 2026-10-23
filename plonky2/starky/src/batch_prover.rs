@@ -434,7 +434,6 @@ where
             .then(|| lookup_challenges.as_ref().unwrap())
     };
 
-    crate::poc_par::stamp("aux-start");
     // Compute the auxiliary polynomials (lookup helpers, then CTL helpers and Zs) of each table.
     let aux_polys_per_table: Vec<Vec<PolynomialValues<F>>> = timed!(
         timing,
@@ -470,7 +469,6 @@ where
             })
             .collect()
     );
-    crate::poc_par::stamp("aux-end");
 
     // Commit each solo table's auxiliary polynomials in its own Merkle tree
     // and the grouped tables' in one shared tree.

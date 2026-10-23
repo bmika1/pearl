@@ -33,33 +33,6 @@ use crate::util::{reverse_bits, transpose_bitrev};
 /// rows in parallel with the scalar `hash_no_pad`; hashers with SIMD batch
 /// implementations may override it to amortize permutation work across
 /// lanes.
-fn pipeline_commit() -> bool {
-    #[cfg(feature = "std")]
-    {
-        std::env::var("POC_PIPELINE")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        false
-    }
-}
-
-fn poc_stamp(label: &str) {
-    #[cfg(feature = "std")]
-    if std::env::var("POC_STAMP")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
-        let ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        eprintln!("POCSTAMP {label} {ms}");
-    }
-}
-
 fn hash_leaf_rows<F, C, const D: usize>(rows: &[Vec<F>]) -> Vec<Vec<F>>
 where
     F: RichField + Extendable<D>,
@@ -198,58 +171,31 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .iter()
             .map(|r| log2_strict(polynomials[r.start].len()))
             .collect();
-        let lde_group = |range: &Range<usize>, timing: &mut TimingTree| {
-            let lde = timed!(
-                timing,
-                "FFT",
-                PolynomialBatch::<F, C, D>::lde_values(
-                    &polynomials[range.clone()],
-                    rate_bits,
-                    false,
-                    None,
-                )
-            );
-            timed!(timing, "transpose LDEs", transpose_bitrev(&lde))
-        };
-        // POC_PIPELINE=1 hashes group i while group i+1 is still in FFT+transpose.
-        // The two sides do not share `timing` (TimingTree is not thread-safe);
-        // the hash side's scopes go to a dropped tree.
-        let (row_values, leaves) = if pipeline_commit() && ranges.len() > 1 {
-            poc_stamp(&format!("commit-pipe-start-{}", degree_bits[0]));
-            let mut row_values = Vec::with_capacity(ranges.len());
-            let mut leaves = Vec::with_capacity(ranges.len());
-            row_values.push(lde_group(&ranges[0], timing));
-            for i in 0..ranges.len() - 1 {
-                let (hashed, next_rows) = plonky2_maybe_rayon::join(
-                    || hash_leaf_rows::<F, C, D>(&row_values[i]),
-                    || {
-                        let mut side = TimingTree::default();
-                        lde_group(&ranges[i + 1], &mut side)
-                    },
+        let row_values: Vec<_> = ranges
+            .iter()
+            .map(|range| {
+                let lde = timed!(
+                    timing,
+                    "FFT",
+                    PolynomialBatch::<F, C, D>::lde_values(
+                        &polynomials[range.clone()],
+                        rate_bits,
+                        false,
+                        None,
+                    )
                 );
-                leaves.push(hashed);
-                row_values.push(next_rows);
-            }
-            leaves.push(hash_leaf_rows::<F, C, D>(row_values.last().unwrap()));
-            poc_stamp(&format!("commit-pipe-end-{}", degree_bits[0]));
-            (row_values, leaves)
-        } else {
-            poc_stamp(&format!("commit-start-{}", degree_bits[0]));
-            let row_values: Vec<_> = ranges
+                let rows = timed!(timing, "transpose LDEs", transpose_bitrev(&lde));
+                rows
+            })
+            .collect();
+        let leaves = timed!(
+            timing,
+            "hash digest leaves",
+            row_values
                 .iter()
-                .map(|range| lde_group(range, timing))
-                .collect();
-            let leaves = timed!(
-                timing,
-                "hash digest leaves",
-                row_values
-                    .iter()
-                    .map(|rows| hash_leaf_rows::<F, C, D>(rows))
-                    .collect()
-            );
-            poc_stamp(&format!("commit-end-{}", degree_bits[0]));
-            (row_values, leaves)
-        };
+                .map(|rows| hash_leaf_rows::<F, C, D>(rows))
+                .collect()
+        );
         let batch_merkle_tree = timed!(
             timing,
             "build digest Merkle tree",
