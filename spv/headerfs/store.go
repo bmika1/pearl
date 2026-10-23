@@ -579,6 +579,11 @@ func (h *blockHeaderStore) WriteHeaders(hdrs ...BlockHeader) error {
 	h.mtx.Lock()
 	defer h.mtx.Unlock()
 
+	// An empty batch would still sync the file and commit an index transaction.
+	if len(hdrs) == 0 {
+		return nil
+	}
+
 	// First, we'll grab a buffer from the write buffer pool so we an
 	// reduce our total number of allocations, and also write the headers
 	// in a single swoop.
