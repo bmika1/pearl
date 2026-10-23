@@ -19,6 +19,7 @@ import (
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
 )
 
+// Names of the header files in the directory of a chain service.
 const (
 	BlockHeadersFileName     = "block_headers.bin"
 	RegFilterHeadersFileName = "reg_filter_headers.bin"
@@ -159,26 +160,23 @@ func (h *headerFile) truncateHeaders(numHeaders uint32,
 	}
 	truncateLength := int64(numHeaders) * int64(headerTypeSize)
 
-	// A negative size fails the truncate syscall (EINVAL, or error 87 on
-	// Windows).
+	// A negative size fails the truncate syscall (EINVAL, or error 87 on Windows).
 	if truncateLength > fileSize {
-		return fmt.Errorf("cannot truncate %d headers from a file of %d "+
-			"bytes", numHeaders, fileSize)
+		return fmt.Errorf("cannot truncate %d headers from a file of %d bytes", numHeaders, fileSize)
 	}
 
 	return h.truncateToSize(fileSize - truncateLength)
 }
 
-// truncatePath is a variable so tests can fail the Windows truncation, which
-// runs after the File is closed and can't be mocked through it.
+// truncatePath is a variable so tests can fail the Windows truncation, which runs after the File is closed and can't be
+// mocked through it.
 var truncatePath = os.Truncate
 
 // truncateToSize truncates the file to newSize bytes.
 //
-// This function handles platform-specific differences in file truncation. On
-// Windows, the file is closed, truncated, and reopened due to Windows
-// limitations on truncating open files. On other platforms, the file is
-// truncated directly without closing.
+// This function handles platform-specific differences in file truncation. On Windows, the file is closed, truncated,
+// and reopened due to Windows limitations on truncating open files. On other platforms, the file is truncated directly
+// without closing.
 func (h *headerFile) truncateToSize(newSize int64) error {
 	if runtime.GOOS == "windows" {
 		fileName := h.file.Name()
@@ -204,9 +202,8 @@ func (h *headerFile) Close() error {
 	return h.file.Close()
 }
 
-// trimPartialRecord cuts a trailing partial header off the file, as appending
-// after one would misalign every later header, and returns the number of
-// headers left.
+// trimPartialRecord cuts a trailing partial header off the file, as appending after one would misalign every later
+// header, and returns the number of headers left.
 func (h *headerStore) trimPartialRecord() (uint32, error) {
 	headerSize, err := h.indexType.Size()
 	if err != nil {
@@ -221,8 +218,7 @@ func (h *headerStore) trimPartialRecord() (uint32, error) {
 	if partial := size % int64(headerSize); partial != 0 {
 		size -= partial
 		if err := h.truncateToSize(size); err != nil {
-			return 0, corruptErrf("cutting off a partial header: %w",
-				err)
+			return 0, corruptErrf("cutting off a partial header: %w", err)
 		}
 	}
 
@@ -305,9 +301,8 @@ var _ BlockHeaderStore = (*blockHeaderStore)(nil)
 // the initial start up of the blockHeaderStore, then the initial genesis
 // header will need to be inserted.
 //
-// A file and index that disagree on the tip are reconciled by cutting back
-// whichever is ahead. If that isn't possible, an error wrapping
-// ErrHeaderStoreCorrupt is returned.
+// A file and index that disagree on the tip are reconciled by cutting back whichever is ahead. If that isn't possible,
+// an error wrapping ErrHeaderStoreCorrupt is returned.
 func NewBlockHeaderStore(filePath string, db walletdb.DB,
 	netParams *chaincfg.Params) (_ BlockHeaderStore, err error) {
 
@@ -332,9 +327,8 @@ func NewBlockHeaderStore(filePath string, db walletdb.DB,
 		return nil, err
 	}
 
-	// If the file holds no header, then this means that we haven't yet
-	// written the initial genesis header to disk, so we'll do so now. Index
-	// entries for headers the file lost would point past its end.
+	// If the file holds no header, then this means that we haven't yet written the initial genesis header to disk, so
+	// we'll do so now. Index entries for headers the file lost would point past its end.
 	if numHeaders == 0 {
 		err := walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
 			return dropEntriesAbove(tx.ReadWriteBucket(indexBucket), 0)
@@ -365,8 +359,7 @@ func NewBlockHeaderStore(filePath string, db walletdb.DB,
 	// Headers were appended but not indexed before a crash.
 	fileHeight := numHeaders - 1
 	if fileHeight > tipHeight {
-		err := bhs.truncateHeaders(fileHeight-tipHeight, bhs.indexType)
-		if err != nil {
+		if err := bhs.truncateHeaders(fileHeight-tipHeight, bhs.indexType); err != nil {
 			return nil, corruptErrf("truncating block headers: %w", err)
 		}
 		fileHeight = tipHeight
@@ -379,16 +372,15 @@ func NewBlockHeaderStore(filePath string, db walletdb.DB,
 	latestHash := latest.BlockHash()
 
 	switch {
-	// The file lost data the OS hadn't written yet, while the index
-	// committed, so only the headers that survived can stay indexed.
+	// The file lost data the OS hadn't written yet, while the index committed, so only the headers that survived can
+	// stay indexed.
 	case fileHeight < tipHeight:
 		if err := bhs.rollbackIndex(&latestHash, fileHeight); err != nil {
 			return nil, err
 		}
 
 	case !tipHash.IsEqual(&latestHash):
-		return nil, corruptErrf("block header %d is not the index tip "+
-			"%v", fileHeight, tipHash)
+		return nil, corruptErrf("block header %d is not the index tip %v", fileHeight, tipHash)
 	}
 
 	return bhs, nil
@@ -854,9 +846,8 @@ var _ FilterHeaderStore = (*filterHeaderStore)(nil)
 // FilterHeaderStore, then the initial genesis filter header will need to be
 // inserted.
 //
-// A file and index that disagree on the tip are reconciled by cutting back
-// whichever is ahead. If that isn't possible, an error wrapping
-// ErrHeaderStoreCorrupt is returned.
+// A file and index that disagree on the tip are reconciled by cutting back whichever is ahead. If that isn't possible,
+// an error wrapping ErrHeaderStoreCorrupt is returned.
 func NewFilterHeaderStore(filePath string, db walletdb.DB,
 	filterType HeaderType, netParams *chaincfg.Params,
 	headerStateAssertion *FilterHeader) (_ FilterHeaderStore, err error) {
@@ -882,8 +873,8 @@ func NewFilterHeaderStore(filePath string, db walletdb.DB,
 		return nil, err
 	}
 
-	// If the file holds no header, then this means that we haven't yet
-	// written the initial genesis header to disk, so we'll do so now.
+	// If the file holds no header, then this means that we haven't yet written the initial genesis header to disk, so
+	// we'll do so now.
 	if numHeaders == 0 {
 		var genesisFilterHash chainhash.Hash
 		switch filterType {
@@ -943,9 +934,8 @@ func NewFilterHeaderStore(filePath string, db walletdb.DB,
 	fileHeight := numHeaders - 1
 	_, tipHeight, err := fhs.chainTip()
 	switch {
-	// The tip is a block that the block header index dropped while being
-	// rolled back to its file. Filter headers can't be ahead of the block
-	// headers, so the tip goes back to the lower of the two.
+	// The tip is a block that the block header index dropped while being rolled back to its file. Filter headers can't
+	// be ahead of the block headers, so the tip goes back to the lower of the two.
 	case errors.Is(err, ErrHeightNotFound):
 		blockIndex := &headerIndex{db: db, indexType: Block}
 		_, blockHeight, err := blockIndex.chainTip()
@@ -960,8 +950,7 @@ func NewFilterHeaderStore(filePath string, db walletdb.DB,
 	case err != nil:
 		return nil, corruptErrf("filter header index: %w", err)
 
-	// The file lost data the OS hadn't written yet, while the index
-	// committed.
+	// The file lost data the OS hadn't written yet, while the index committed.
 	case fileHeight < tipHeight:
 		if err := fhs.setTipAtHeight(fileHeight); err != nil {
 			return nil, err
@@ -972,8 +961,7 @@ func NewFilterHeaderStore(filePath string, db walletdb.DB,
 
 	// Headers were appended but not indexed before a crash.
 	if fileHeight > tipHeight {
-		err := fhs.truncateHeaders(fileHeight-tipHeight, fhs.indexType)
-		if err != nil {
+		if err := fhs.truncateHeaders(fileHeight-tipHeight, fhs.indexType); err != nil {
 			return nil, corruptErrf("truncating filter headers: %w", err)
 		}
 	}

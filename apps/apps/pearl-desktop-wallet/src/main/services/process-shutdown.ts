@@ -36,8 +36,8 @@ function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
   });
 }
 
-// taskkill without /F asks the process to close its windows. Console programs have none, for which it fails at
-// once, so the exit code tells whether waiting for the process is worthwhile.
+// taskkill without /F asks the process to close its windows. Console programs have none, for which it fails at once,
+// so the exit code tells whether waiting for the process is worthwhile.
 function closeWindowsProcess(pid: number): Promise<boolean> {
   return new Promise<boolean>(resolve => {
     const taskkill = spawn('taskkill', ['/PID', String(pid), '/T'], {stdio: 'ignore', windowsHide: true});

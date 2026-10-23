@@ -437,8 +437,8 @@ class WalletProcess {
   }
 
   async stop(options: { force?: boolean } = {}) {
-    // A process that is still starting up has to be stopped too, or it outlives the app and keeps the wallet files
-    // and the RPC port.
+    // A process that is still starting up has to be stopped too, or it outlives the app and keeps the wallet files and
+    // the RPC port.
     const proc = this.process;
     if (!proc) {
       return { success: false as const, message: 'Wallet is not running' };

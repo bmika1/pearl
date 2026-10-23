@@ -127,11 +127,10 @@ class ManagerService implements ManagerApi {
     this.currentWallet = null;
   }
 
-  // Fast path for the Lock button while the wallet is mid-block-recovery. The
-  // `walletlock` RPC would sit on Wallet.walletLocker -> `<-endRecovery()` for
-  // up to a minute, so we skip it entirely and give the child two seconds to
-  // stop before killing it. Safe because bbolt write txns are atomic at commit;
-  // a mid-batch kill just replays that batch on the next open.
+  // Fast path for the Lock button while the wallet is mid-block-recovery. The `walletlock` RPC would sit on
+  // Wallet.walletLocker -> `<-endRecovery()` for up to a minute, so we skip it entirely and give the child two seconds
+  // to stop before killing it. Safe because bbolt write txns are atomic at commit; a mid-batch kill just replays that
+  // batch on the next open.
   async forceLockWallet() {
     await this.stopWalletProcess({ force: true });
     this.currentWallet = null;

@@ -196,12 +196,10 @@ func TestAppendRow(t *testing.T) {
 
 			hdrFile := &headerFile{file: mockFile}
 
-			// A rollback on Windows replaces the handle, and an open
-			// file can't be removed there: close the current one.
+			// A rollback on Windows replaces the handle, and Windows can't remove an open file: close the current one.
 			defer func() { _ = hdrFile.file.Close() }()
 
-			// Windows truncates the closed file by path, bypassing
-			// mockFile.Truncate: fail that call too.
+			// Windows truncates the closed file by path, bypassing mockFile.Truncate: fail that call too.
 			if test.truncFn != nil {
 				prev := truncatePath
 				truncatePath = func(path string, size int64) error {
@@ -231,8 +229,7 @@ func TestAppendRow(t *testing.T) {
 					"in %q", test.errMsg, err.Error())
 			}
 
-			// Read by path: a rollback on Windows closes the handle
-			// created above.
+			// Read by path: a rollback on Windows closes the handle created above.
 			actualData, err := os.ReadFile(tmpFile.Name())
 			if err != nil {
 				t.Fatalf("Failed to read file: %v", err)

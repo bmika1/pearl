@@ -1712,8 +1712,8 @@ func (s *ChainService) Stop() error {
 	return returnErr
 }
 
-// closeHeaderStores closes the header files. Not every store implementation
-// has one, so Close isn't part of the store interfaces.
+// closeHeaderStores closes the header files. Not every store implementation has one, so Close isn't part of the store
+// interfaces.
 func (s *ChainService) closeHeaderStores() {
 	for _, store := range []interface{}{s.BlockHeaders, s.RegFilterHeaders} {
 		if closer, ok := store.(io.Closer); ok {

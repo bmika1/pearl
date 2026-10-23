@@ -16,8 +16,7 @@ type ErrHeaderNotFound struct {
 
 // appendRaw appends a new raw header to the end of the flat file.
 func (h *headerStore) appendRaw(header []byte) error {
-	// Roll back to the size rather than the position: a file opened for
-	// appending is at position zero until its first write.
+	// Roll back to the size, not the position: a file opened for appending is at position zero until its first write.
 	fileInfo, err := h.file.Stat()
 	if err != nil {
 		return err
@@ -43,17 +42,14 @@ func (h *headerStore) appendRaw(header []byte) error {
 			"error: %w", h.indexType, err)
 	}
 
-	// The index is durable once its transaction commits, so the headers it
-	// refers to must be on disk first. A crash would otherwise leave the
-	// index ahead of the file.
+	// The index is durable once its transaction commits, so the headers it refers to must be on disk first. A crash
+	// would otherwise leave the index ahead of the file.
 	if err := h.file.Sync(); err != nil {
 		if truncErr := h.truncateToSize(size); truncErr != nil {
-			return fmt.Errorf("failed to sync header type %s: %w, "+
-				"truncate error: %v", h.indexType, err, truncErr)
+			return fmt.Errorf("failed to sync header type %s: %w, truncate error: %v", h.indexType, err, truncErr)
 		}
 
-		return fmt.Errorf("failed to sync header type %s: %w",
-			h.indexType, err)
+		return fmt.Errorf("failed to sync header type %s: %w", h.indexType, err)
 	}
 
 	return nil

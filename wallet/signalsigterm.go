@@ -12,8 +12,7 @@ import (
 	"syscall"
 )
 
-// Windows delivers closing the console, logging off and shutting down as
-// SIGTERM.
+// Windows delivers closing the console, logging off and shutting down as SIGTERM.
 func init() {
 	signals = []os.Signal{os.Interrupt, syscall.SIGTERM}
 }
