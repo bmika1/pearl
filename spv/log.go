@@ -10,7 +10,6 @@ import (
 	"github.com/pearl-research-labs/pearl/spv/blockntfns"
 	"github.com/pearl-research-labs/pearl/spv/chanutils"
 	"github.com/pearl-research-labs/pearl/spv/filterdb"
-	"github.com/pearl-research-labs/pearl/spv/headerfs"
 	"github.com/pearl-research-labs/pearl/spv/query"
 )
 
@@ -43,6 +42,5 @@ func UseLogger(logger btclog.Logger) {
 	connmgr.UseLogger(logger)
 	query.UseLogger(logger)
 	filterdb.UseLogger(logger)
-	headerfs.UseLogger(logger)
 	chanutils.UseLogger(logger)
 }

@@ -16,14 +16,13 @@ type ErrHeaderNotFound struct {
 
 // appendRaw appends a new raw header to the end of the flat file.
 func (h *headerStore) appendRaw(header []byte) error {
-	// The size is what we revert to if the write fails partially. The
-	// position of a file opened for appending stays at zero until the first
-	// write, so it can't be used for this.
+	// Roll back to the size rather than the position: a file opened for
+	// appending is at position zero until its first write.
 	fileInfo, err := h.file.Stat()
 	if err != nil {
 		return err
 	}
-	startSize := fileInfo.Size()
+	size := fileInfo.Size()
 
 	n, err := h.file.Write(header)
 	if err != nil {
@@ -31,7 +30,7 @@ func (h *headerStore) appendRaw(header []byte) error {
 		// truncate the file back to its original size to maintain
 		// consistency. This removes the partial/corrupt header.
 		if n > 0 {
-			truncErr := h.truncateToSize(startSize)
+			truncErr := h.truncateToSize(size)
 			if truncErr != nil {
 				return fmt.Errorf("failed to write header "+
 					"type %s: partial write (%d bytes), "+
@@ -45,18 +44,16 @@ func (h *headerStore) appendRaw(header []byte) error {
 	}
 
 	// The index is durable once its transaction commits, so the headers it
-	// refers to must be on disk before that. Otherwise a crash leaves the
+	// refers to must be on disk first. A crash would otherwise leave the
 	// index ahead of the file.
 	if err := h.file.Sync(); err != nil {
-		truncErr := h.truncateToSize(startSize)
-		if truncErr != nil {
-			return fmt.Errorf("failed to sync header type %s: "+
-				"sync error: %w, truncate error: %v",
-				h.indexType, err, truncErr)
+		if truncErr := h.truncateToSize(size); truncErr != nil {
+			return fmt.Errorf("failed to sync header type %s: %w, "+
+				"truncate error: %v", h.indexType, err, truncErr)
 		}
 
-		return fmt.Errorf("failed to sync header type %s: sync "+
-			"error: %w", h.indexType, err)
+		return fmt.Errorf("failed to sync header type %s: %w",
+			h.indexType, err)
 	}
 
 	return nil

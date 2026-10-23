@@ -19,7 +19,9 @@ func TestAppendRow(t *testing.T) {
 		initialData   []byte
 		headerToWrite []byte
 		writeFn       func([]byte, File) (int, error)
+		syncFn        func() error
 		truncFn       func(int64, File) error
+		reopened      bool
 		expected      []byte
 		wantErr       bool
 		errMsg        string
@@ -123,6 +125,37 @@ func TestAppendRow(t *testing.T) {
 				"error: simulated truncate failure", Block),
 		},
 		{
+			name:          "PartialWrite AfterReopen KeepsData",
+			initialData:   []byte{0x01, 0x02, 0x03},
+			headerToWrite: []byte{0x04, 0x05, 0x06},
+			writeFn: func(p []byte, file File) (int, error) {
+				if _, err := file.Seek(0, io.SeekEnd); err != nil {
+					return 0, err
+				}
+				n, err := file.Write(p[:1])
+				if err != nil {
+					return n, err
+				}
+
+				return n, errors.New("disk full")
+			},
+			reopened: true,
+			expected: []byte{0x01, 0x02, 0x03},
+			wantErr:  true,
+			errMsg:   "disk full",
+		},
+		{
+			name:          "SyncError RollsBack",
+			initialData:   []byte{0x01, 0x02, 0x03},
+			headerToWrite: []byte{0x04, 0x05, 0x06},
+			syncFn: func() error {
+				return errors.New("sync failure")
+			},
+			expected: []byte{0x01, 0x02, 0x03},
+			wantErr:  true,
+			errMsg:   "sync failure",
+		},
+		{
 			name:          "NormalWrite ValidHeader DataAppended",
 			initialData:   []byte{},
 			headerToWrite: []byte{0x01, 0x02, 0x03},
@@ -144,9 +177,11 @@ func TestAppendRow(t *testing.T) {
 			}
 
 			// Reset the file position to the end of initial data.
-			_, err = tmpFile.Seek(
-				int64(len(test.initialData)), io.SeekStart,
-			)
+			position := int64(len(test.initialData))
+			if test.reopened {
+				position = 0
+			}
+			_, err = tmpFile.Seek(position, io.SeekStart)
 			if err != nil {
 				t.Fatalf("Failed to seek: %v", err)
 			}
@@ -155,6 +190,7 @@ func TestAppendRow(t *testing.T) {
 			mockFile := &mockFile{
 				File:    tmpFile,
 				writeFn: test.writeFn,
+				syncFn:  test.syncFn,
 				truncFn: test.truncFn,
 			}
 
