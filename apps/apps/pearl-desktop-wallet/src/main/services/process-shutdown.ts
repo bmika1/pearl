@@ -59,13 +59,15 @@ async function deliverStop(options: ShutdownOptions, log: ShutdownLogger, pid: n
   const timedOut = new Promise<boolean>(resolve => {
     timer = setTimeout(() => resolve(false), options.stopTimeoutMs);
   });
-  const request = options.requestStop().then(
-    () => true,
-    error => {
-      log.warn(`Could not ask process ${pid} to stop: ${errorMessage(error)}`);
-      return false;
-    }
-  );
+  const request = Promise.resolve()
+    .then(() => options.requestStop())
+    .then(
+      () => true,
+      error => {
+        log.warn(`Could not ask process ${pid} to stop: ${errorMessage(error)}`);
+        return false;
+      }
+    );
 
   try {
     return await Promise.race([request, timedOut]);

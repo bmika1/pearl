@@ -107,6 +107,15 @@ test('goes on at once when the stop request cannot be delivered', async () => {
   assert.match(warnings[0], /ECONNREFUSED/);
 });
 
+test('a stop request that throws counts as undeliverable', async () => {
+  const proc = new FakeProcess({exitsOn: ['SIGTERM']});
+  const requestStop = () => {
+    throw new Error('not connected');
+  };
+
+  assert.equal(await shutdownProcess(proc, stopOptions(proc, {requestStop})), 'terminated');
+});
+
 test('does not wait longer than the stop timeout for the stop request', async () => {
   const proc = new FakeProcess({exitsOn: ['SIGTERM']});
   const requestStop = () => new Promise(() => undefined);
