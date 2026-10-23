@@ -151,14 +151,10 @@ func (s *UtxoScanner) Stop() error {
 
 	close(s.quit)
 
-batchShutdown:
-	for {
-		select {
-		case <-s.shutdown:
-			break batchShutdown
-		case <-time.After(50 * time.Millisecond):
-			s.cv.Signal()
-		}
+	// The batch manager closes shutdown as it exits, so there is only
+	// something to wait for if it was ever started.
+	if atomic.LoadUint32(&s.started) == 1 {
+		s.waitForBatchManager()
 	}
 
 	// Cancel all pending get utxo requests that were not pulled into the
@@ -169,6 +165,19 @@ batchShutdown:
 	}
 
 	return nil
+}
+
+// waitForBatchManager waits for the batch manager to exit, waking it up for as
+// long as it is idle.
+func (s *UtxoScanner) waitForBatchManager() {
+	for {
+		select {
+		case <-s.shutdown:
+			return
+		case <-time.After(50 * time.Millisecond):
+			s.cv.Signal()
+		}
+	}
 }
 
 // Enqueue takes a GetUtxoRequest and adds it to the next applicable batch.

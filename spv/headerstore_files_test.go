@@ -85,6 +85,35 @@ func TestChainServiceReleasesHeaderFiles(t *testing.T) {
 	require.Empty(t, openHeaderFiles(t, dir))
 }
 
+// TestChainServiceStopWithoutStart makes sure a chain service that never
+// started, as after a failed start, can be stopped and lets go of its files.
+func TestChainServiceStopWithoutStart(t *testing.T) {
+	dir := t.TempDir()
+	db, err := walletdb.Create(
+		"bdb", filepath.Join(dir, "neutrino.db"), true,
+		10*time.Second, false,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, db.Close()) })
+
+	cs, err := NewChainService(Config{
+		DataDir: dir, Database: db, ChainParams: chaincfg.SimNetParams,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, openHeaderFiles(t, dir))
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- cs.Stop() }()
+
+	select {
+	case err := <-stopped:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop didn't return for a service that was never started")
+	}
+	require.Empty(t, openHeaderFiles(t, dir))
+}
+
 // TestChainServiceStartsWithShortHeaderFiles is the scenario behind the chain
 // service failing to start for good: the header files lost their tail while
 // the database kept the full chain.
