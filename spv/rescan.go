@@ -103,8 +103,12 @@ type rescanOptions struct {
 	watchList   [][]byte
 	txIdx       uint32
 
-	// reorgedTip is set when this rescan resumes an exited one whose last notified block has left the best chain.
-	reorgedTip *reorgedTip
+	// notifiedSeed holds the blocks an exited rescan notified that this one, resuming it, continues from.
+	notifiedSeed []notifiedBlock
+
+	// reorgedFrom is set when this rescan resumes an exited one whose notified blocks have left the best chain. It is
+	// the first of those blocks.
+	reorgedFrom *notifiedBlock
 
 	update <-chan *updateOptions
 	quit   <-chan struct{}
@@ -520,17 +524,18 @@ func (rs *rescanState) rescan() error {
 	// the tip of the chain.
 	current := false
 
-	// The caller still holds the reorged block and learns it is gone only from this notification, which must come
-	// before the blocks that replaced it.
-	if tip := ro.reorgedTip; tip != nil {
+	// The caller still holds the reorged blocks and learns they are gone only from this notification, which must come
+	// before the blocks that replaced them. Dropping the first drops every block after it as well.
+	if block := ro.reorgedFrom; block != nil {
 		if ro.ntfn.OnBlockDisconnected != nil { // nolint:staticcheck
 			ro.ntfn.OnBlockDisconnected( // nolint:staticcheck
-				&tip.stamp.Hash, tip.stamp.Height, tip.header.Timestamp,
+				&block.stamp.Hash, block.stamp.Height,
+				block.header.Timestamp,
 			)
 		}
 		if ro.ntfn.OnFilteredBlockDisconnected != nil {
 			ro.ntfn.OnFilteredBlockDisconnected(
-				tip.stamp.Height, &tip.header,
+				block.stamp.Height, &block.header,
 			)
 		}
 	}
@@ -830,16 +835,75 @@ func (rs *rescanState) waitForRetry(interval time.Duration) error {
 	}
 }
 
-// resumeOverlap is how many blocks before the last one notified a resumed rescan starts when that block has left the
-// best chain, so the blocks which replaced it, and any below it that were replaced too, are scanned on the best chain.
-// Only the last block is reported as disconnected, since the rescan keeps no hash for the ones below it, so the caller
-// reconciles what it recorded in those.
-const resumeOverlap = 6
+// maxNotifiedBlocks is how many of the blocks a rescan notified it remembers. A reorg that replaced more of them while
+// the rescan was down is only reported from the oldest one remembered.
+const maxNotifiedBlocks = 100
 
-// reorgedTip is a block a rescan notified that has since left the best chain.
-type reorgedTip struct {
+// notifiedBlock is a block a rescan reported connected.
+type notifiedBlock struct {
 	stamp  headerfs.BlockStamp
 	header wire.BlockHeader
+}
+
+// notifiedBlocks remembers the latest blocks a rescan reported connected, oldest first. A rescan that resumes after the
+// exit of this one needs them to tell which the best chain dropped meanwhile, since the header store forgets blocks it
+// reorgs out and the caller is only told of the reorg by a disconnect.
+type notifiedBlocks struct {
+	blocks []notifiedBlock
+}
+
+// connected remembers a block reported connected, replacing any remembered block at its height or above.
+func (n *notifiedBlocks) connected(height int32, header *wire.BlockHeader) {
+	n.disconnected(height)
+
+	n.blocks = append(n.blocks, notifiedBlock{
+		stamp: headerfs.BlockStamp{
+			Height:    height,
+			Hash:      header.BlockHash(),
+			Timestamp: header.Timestamp,
+		},
+		header: *header,
+	})
+
+	if excess := len(n.blocks) - maxNotifiedBlocks; excess > 0 {
+		n.blocks = slices.Delete(n.blocks, 0, excess)
+	}
+}
+
+// disconnected forgets the remembered blocks at the height and above.
+func (n *notifiedBlocks) disconnected(height int32) {
+	for len(n.blocks) > 0 && n.blocks[len(n.blocks)-1].stamp.Height >= height {
+		n.blocks = n.blocks[:len(n.blocks)-1]
+	}
+}
+
+// recordNotified makes a rescan remember the blocks it reports connected and disconnected. It wraps the handlers set
+// before it, so it must be applied after them. A rescan resuming an exited one starts from the blocks that one
+// remembered.
+func recordNotified(history *notifiedBlocks) RescanOption {
+	return func(ro *rescanOptions) {
+		history.blocks = slices.Clone(ro.notifiedSeed)
+
+		connected := ro.ntfn.OnFilteredBlockConnected
+		disconnected := ro.ntfn.OnFilteredBlockDisconnected
+
+		ro.ntfn.OnFilteredBlockConnected = func(height int32,
+			header *wire.BlockHeader, relevantTxs []*btcutil.Tx) {
+
+			if connected != nil {
+				connected(height, header, relevantTxs)
+			}
+			history.connected(height, header)
+		}
+		ro.ntfn.OnFilteredBlockDisconnected = func(height int32,
+			header *wire.BlockHeader) {
+
+			if disconnected != nil {
+				disconnected(height, header)
+			}
+			history.disconnected(height)
+		}
+	}
 }
 
 // resumeState is what a replacement rescan needs to continue from where an exited one stopped. The watch lists grow
@@ -847,40 +911,75 @@ type reorgedTip struct {
 type resumeState struct {
 	watchAddrs  []btcutil.Address
 	watchInputs []InputWithScript
-	lastBlock   headerfs.BlockStamp
-	lastHeader  wire.BlockHeader
+
+	// notified are the blocks the rescan remembered, and lastBlock its position, which only differs from the newest of
+	// them when it notified none.
+	notified  []notifiedBlock
+	lastBlock headerfs.BlockStamp
 }
 
 // captureResume records the state a replacement rescan resumes from.
-func (rs *rescanState) captureResume() *resumeState {
+func (rs *rescanState) captureResume(notified []notifiedBlock) *resumeState {
 	return &resumeState{
 		watchAddrs:  slices.Clone(rs.opts.watchAddrs),
 		watchInputs: slices.Clone(rs.opts.watchInputs),
+		notified:    slices.Clone(notified),
 		lastBlock:   rs.curStamp,
-		lastHeader:  rs.curHeader,
 	}
 }
 
-// option returns the rescan option that applies the state. The block a rescan last notified can be reorged out while
-// the rescan is down, without its caller hearing of it, so a last block that has left the best chain is reported as
-// disconnected and the start moves back to where the blocks that replaced it are notified.
+// option returns the rescan option that applies the state. Blocks the rescan notified can leave the best chain while it
+// is down, without its caller hearing of it. The resumed rescan then starts at the newest notified block still on the
+// best chain and reports the next one as disconnected, which makes the caller drop it and every block after it, before
+// it notifies the blocks that replaced them.
 func (s *resumeState) option(chain ChainSource) RescanOption {
-	start := s.lastBlock
+	start, seed := s.lastBlock, s.notified
 
-	var reorged *reorgedTip
-	if _, _, err := chain.GetBlockHeader(&start.Hash); err != nil {
-		reorged = &reorgedTip{stamp: s.lastBlock, header: s.lastHeader}
-		start = headerfs.BlockStamp{Height: max(start.Height-resumeOverlap, 0)}
+	var reorgedFrom *notifiedBlock
+	if len(s.notified) > 0 {
+		forkIdx := len(s.notified) - 1
+		for ; forkIdx >= 0; forkIdx-- {
+			if !leftBestChain(chain, &s.notified[forkIdx].stamp.Hash) {
+				break
+			}
+		}
+
+		switch {
+		case forkIdx == len(s.notified)-1:
+			start = s.notified[forkIdx].stamp
+
+		case forkIdx >= 0:
+			reorgedFrom = &s.notified[forkIdx+1]
+			start = s.notified[forkIdx].stamp
+			seed = s.notified[:forkIdx+1]
+
+		// Everything remembered is gone, so the block before the oldest of them is the best this can do.
+		default:
+			reorgedFrom = &s.notified[0]
+			start = headerfs.BlockStamp{
+				Height: max(s.notified[0].stamp.Height-1, 0),
+			}
+			seed = nil
+		}
 	}
 
 	return func(ro *rescanOptions) {
 		ro.watchAddrs = slices.Clone(s.watchAddrs)
 		ro.watchInputs = slices.Clone(s.watchInputs)
-		ro.reorgedTip = reorged
+		ro.notifiedSeed = slices.Clone(seed)
+		ro.reorgedFrom = reorgedFrom
 
 		startBlock := start
 		ro.startBlock = &startBlock
 	}
+}
+
+// leftBestChain returns whether the header store has dropped the block, which it does when it reorgs the block out.
+// Any other failure to look the block up says nothing about the chain, so it counts as still being on it.
+func leftBestChain(chain ChainSource, hash *chainhash.Hash) bool {
+	_, _, err := chain.GetBlockHeader(hash)
+
+	return errors.Is(err, headerfs.ErrHashNotFound)
 }
 
 // waitForBlocks is a helper function that can be used to wait on block
@@ -1516,7 +1615,10 @@ func (r *Rescan) Start() <-chan error {
 	go func() {
 		defer r.wg.Done()
 
-		rescanArgs := append(r.options, updateChan(r.updateChan)) // nolint
+		history := &notifiedBlocks{}
+		rescanArgs := append(slices.Clone(r.options),
+			recordNotified(history), updateChan(r.updateChan),
+		)
 		rs, err := newRescanState(r.chain, rescanArgs...)
 		if err == nil {
 			err = rs.rescan()
@@ -1526,7 +1628,7 @@ func (r *Rescan) Start() <-chan error {
 		r.errMtx.Lock()
 		r.err = err
 		if rs != nil {
-			r.resume = rs.captureResume()
+			r.resume = rs.captureResume(history.blocks)
 		}
 		r.errMtx.Unlock()
 
@@ -1540,10 +1642,10 @@ func (r *Rescan) Start() <-chan error {
 
 // ResumeOptions returns the options for a new rescan that continues where this one exited. The new rescan watches every
 // address and input this one did, including the outputs it matched along the way, and starts at the last block this
-// one notified, or a few blocks earlier if that block has since left the best chain, in which case it is reported as
-// disconnected and blocks the caller already has are notified again. The options include those this rescan was
-// created with, so a caller replaces one of them, such as QuitChan, by appending its own. It returns nil while the
-// rescan is running, and if it exited before it started scanning.
+// one notified. If the best chain has dropped blocks this one notified, it starts at the newest that remains and first
+// reports the oldest dropped block as disconnected, which tells the caller to drop it and every block after it. The
+// options include those this rescan was created with, so a caller replaces one of them, such as QuitChan, by appending
+// its own. It returns nil while the rescan is running, and if it exited before it started scanning.
 func (r *Rescan) ResumeOptions() []RescanOption {
 	select {
 	case <-r.running:

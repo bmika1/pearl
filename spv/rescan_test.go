@@ -3,6 +3,7 @@ package neutrino
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"runtime/pprof"
@@ -272,7 +273,7 @@ func (c *mockChainSource) GetBlockHeader(
 
 	blockHeader, ok := c.blockHeaders[*hash]
 	if !ok {
-		return nil, 0, errors.New("block header not found")
+		return nil, 0, headerfs.ErrHashNotFound
 	}
 	blockHeight, ok := c.blockHeightIndex[*hash]
 	if !ok {
@@ -1040,7 +1041,7 @@ func TestRescanStateResumeOption(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, matched)
 
-	resume := rs.captureResume().option(chain)
+	resume := rs.captureResume(nil).option(chain)
 
 	restored := &rescanOptions{}
 	resume(restored)
@@ -1051,7 +1052,7 @@ func TestRescanStateResumeOption(t *testing.T) {
 		PkScript: watchedScript,
 	}}, restored.watchInputs)
 	require.Equal(t, lastBlock, restored.startBlock)
-	require.Nil(t, restored.reorgedTip)
+	require.Nil(t, restored.reorgedFrom)
 
 	// Each application gets its own copy, so a rescan's updates never reach another.
 	other := &rescanOptions{}
@@ -1060,39 +1061,146 @@ func TestRescanStateResumeOption(t *testing.T) {
 	require.Equal(t, []btcutil.Address{watched}, other.watchAddrs)
 }
 
-// TestRescanStateResumeOptionStartsBeforeReorgedBlock pins that a last block which has left the best chain is marked
-// to be reported as disconnected and moves the start back, by height since its hash no longer resolves, and never
-// below the genesis block.
-func TestRescanStateResumeOptionStartsBeforeReorgedBlock(t *testing.T) {
+// testNotifiedHeader returns a header whose hash is unique per height and variant.
+func testNotifiedHeader(height int32, variant uint32) *wire.BlockHeader {
+	return &wire.BlockHeader{
+		Version:   1,
+		Timestamp: time.Unix(int64(height), 0),
+		Bits:      variant,
+	}
+}
+
+// TestNotifiedBlocks pins that the remembered blocks follow what the rescan reported: a connected block replaces the
+// ones at its height and above, a disconnect drops them, and only the latest blocks are kept.
+func TestNotifiedBlocks(t *testing.T) {
 	t.Parallel()
 
-	chain := newMockChainSource(10)
-	reorged := chainhash.Hash{9}
+	heights := func(n *notifiedBlocks) []int32 {
+		var heights []int32
+		for _, block := range n.blocks {
+			heights = append(heights, block.stamp.Height)
+		}
+
+		return heights
+	}
+
+	history := &notifiedBlocks{}
+	for height := int32(1); height <= 3; height++ {
+		history.connected(height, testNotifiedHeader(height, 0))
+	}
+	require.Equal(t, []int32{1, 2, 3}, heights(history))
+
+	replacement := testNotifiedHeader(2, 1)
+	history.connected(2, replacement)
+	require.Equal(t, []int32{1, 2}, heights(history))
+	require.Equal(t, replacement.BlockHash(), history.blocks[1].stamp.Hash)
+
+	history.disconnected(2)
+	require.Equal(t, []int32{1}, heights(history))
+
+	history.disconnected(1)
+	require.Empty(t, history.blocks)
+
+	for height := int32(1); height <= maxNotifiedBlocks+5; height++ {
+		history.connected(height, testNotifiedHeader(height, 0))
+	}
+	require.Len(t, history.blocks, maxNotifiedBlocks)
+	require.Equal(t, int32(6), history.blocks[0].stamp.Height)
+	require.Equal(t, int32(maxNotifiedBlocks+5), history.blocks[maxNotifiedBlocks-1].stamp.Height)
+}
+
+// failingHeaderChain is a mockChainSource whose header lookups by hash fail with err.
+type failingHeaderChain struct {
+	*mockChainSource
+
+	err error
+}
+
+func (c *failingHeaderChain) GetBlockHeader(*chainhash.Hash) (*wire.BlockHeader, uint32, error) {
+	return nil, 0, c.err
+}
+
+// TestResumeStateOptionReconcilesNotifiedBlocks pins where a resumed rescan starts, and what it reports as
+// disconnected, when the best chain dropped some of the blocks the exited rescan notified.
+func TestResumeStateOptionReconcilesNotifiedBlocks(t *testing.T) {
+	t.Parallel()
+
+	const numNotified = 5
 
 	for _, tt := range []struct {
-		name        string
-		height      int32
-		wantStartAt int32
+		name string
+
+		// reorgDepth is how many of the newest notified blocks the best chain drops.
+		reorgDepth int
+
+		// headerErr, if set, is what every header lookup fails with instead.
+		headerErr error
 	}{
-		{"above the overlap", 8, 8 - resumeOverlap},
-		{"within the overlap of genesis", 2, 0},
+		{name: "still on the best chain"},
+		{name: "newest dropped", reorgDepth: 1},
+		{name: "newest three dropped", reorgDepth: 3},
+		{name: "all dropped", reorgDepth: numNotified},
+		{name: "lookup fails for another reason", headerErr: errors.New("store closed")},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
+			chain := newMockChainSource(10)
+			top, err := chain.BestBlock()
+			require.NoError(t, err)
+
+			var notified []notifiedBlock
+			for height := top.Height - numNotified + 1; height <= top.Height; height++ {
+				stamp := chain.blockStampAt(height)
+				header, _, err := chain.GetBlockHeader(&stamp.Hash)
+				require.NoError(t, err)
+
+				notified = append(notified, notifiedBlock{stamp: stamp, header: *header})
+			}
+
+			for i := 0; i < tt.reorgDepth; i++ {
+				chain.rollback(false)
+			}
+			for i := 0; i < tt.reorgDepth; i++ {
+				best, err := chain.BestBlock()
+				require.NoError(t, err)
+
+				chain.addNewBlockWithHeader(&wire.BlockHeader{PrevBlock: best.Hash, Bits: 1}, false)
+			}
+
 			rs := &rescanState{
 				opts:     &rescanOptions{},
-				curStamp: headerfs.BlockStamp{Height: tt.height, Hash: reorged},
+				curStamp: notified[numNotified-1].stamp,
+			}
+
+			var source ChainSource = chain
+			if tt.headerErr != nil {
+				source = &failingHeaderChain{mockChainSource: chain, err: tt.headerErr}
 			}
 
 			restored := &rescanOptions{}
-			rs.captureResume().option(chain)(restored)
+			rs.captureResume(notified).option(source)(restored)
 
-			require.Equal(t,
-				&headerfs.BlockStamp{Height: tt.wantStartAt}, restored.startBlock,
-			)
-			require.NotNil(t, restored.reorgedTip)
-			require.Equal(t, rs.curStamp, restored.reorgedTip.stamp)
+			forkIdx := numNotified - 1 - tt.reorgDepth
+			switch {
+			case tt.reorgDepth == 0 || tt.headerErr != nil:
+				require.Nil(t, restored.reorgedFrom)
+				require.Equal(t, &notified[numNotified-1].stamp, restored.startBlock)
+				require.Equal(t, notified, restored.notifiedSeed)
+
+			case forkIdx >= 0:
+				require.Equal(t, &notified[forkIdx+1], restored.reorgedFrom)
+				require.Equal(t, &notified[forkIdx].stamp, restored.startBlock)
+				require.Equal(t, notified[:forkIdx+1], restored.notifiedSeed)
+
+			default:
+				require.Equal(t, &notified[0], restored.reorgedFrom)
+				require.Equal(t,
+					&headerfs.BlockStamp{Height: notified[0].stamp.Height - 1},
+					restored.startBlock,
+				)
+				require.Empty(t, restored.notifiedSeed)
+			}
 		})
 	}
 }
@@ -1132,43 +1240,63 @@ func TestRescanResumeAfterExit(t *testing.T) {
 	ctx.recvBlockConnected(block3)
 }
 
-// TestRescanResumeAfterReorgWhileExited pins that a rescan resumed after the block it last notified was replaced
-// reports that block as disconnected and starts before it, so the blocks which replaced it are notified.
+// TestRescanResumeAfterReorgWhileExited pins that a rescan resumed after the best chain dropped blocks the exited
+// rescan notified reports the oldest dropped block as disconnected once, then notifies the blocks which replaced them
+// from the fork point on, without replaying the blocks below it.
 func TestRescanResumeAfterReorgWhileExited(t *testing.T) {
 	t.Parallel()
 
-	ctx := newRescanTestContext(t, 10,
-		StartTime(time.Time{}),
-		WatchInputs(InputWithScript{PkScript: testWatchScript}),
-	)
-	ctx.start(true)
+	const numNotified = 3
 
-	block := ctx.chain.addNewBlock(true)
-	ctx.assertFilterQueried(block.Hash)
-	ctx.recvBlockConnected(block)
+	for depth := 1; depth <= numNotified; depth++ {
+		t.Run(fmt.Sprintf("depth %d", depth), func(t *testing.T) {
+			t.Parallel()
 
-	ctx.exitOnCanceledSubscription()
+			ctx := newRescanTestContext(t, 10,
+				StartTime(time.Time{}),
+				WatchInputs(InputWithScript{PkScript: testWatchScript}),
+			)
+			ctx.start(true)
 
-	forkPoint := ctx.chain.rollback(false)
-	replacement := ctx.chain.addNewBlockWithHeader(
-		&wire.BlockHeader{PrevBlock: forkPoint.Hash}, false,
-	)
-	require.NotEqual(t, block.Hash, replacement.Hash)
-	next := ctx.chain.addNewBlock(false)
+			var notified []headerfs.BlockStamp
+			for i := 0; i < numNotified; i++ {
+				block := ctx.chain.addNewBlock(true)
+				ctx.assertFilterQueried(block.Hash)
+				ctx.recvBlockConnected(block)
 
-	subscribed := ctx.resume()
-	defer ctx.stop()
+				notified = append(notified, block)
+			}
 
-	ctx.recvBlockDisconnected(block)
+			ctx.exitOnCanceledSubscription()
 
-	// The blocks before the replaced one are notified again, then the replacement and the block after it.
-	for height := block.Height - resumeOverlap + 1; height <= next.Height; height++ {
-		stamp := ctx.chain.blockStampAt(height)
-		ctx.assertFilterQueried(stamp.Hash)
-		ctx.recvBlockConnected(stamp)
+			// The newest blocks the rescan notified are replaced, and the chain grows past where it was.
+			forkHeight := notified[numNotified-1].Height - int32(depth)
+			ctx.chain.rollbackToHeight(forkHeight, false)
+			for i := 0; i <= depth; i++ {
+				best, err := ctx.chain.BestBlock()
+				require.NoError(t, err)
+
+				ctx.chain.addNewBlockWithHeader(
+					&wire.BlockHeader{PrevBlock: best.Hash, Bits: 1}, false,
+				)
+			}
+
+			subscribed := ctx.resume()
+			defer ctx.stop()
+
+			ctx.recvBlockDisconnected(notified[numNotified-depth])
+
+			best, err := ctx.chain.BestBlock()
+			require.NoError(t, err)
+			for height := forkHeight + 1; height <= best.Height; height++ {
+				stamp := ctx.chain.blockStampAt(height)
+				ctx.assertFilterQueried(stamp.Hash)
+				ctx.recvBlockConnected(stamp)
+			}
+
+			ctx.assertSubscribed(subscribed)
+		})
 	}
-
-	ctx.assertSubscribed(subscribed)
 }
 
 // TestRescanResumeOptionsAfterFailedCatchUpBlock pins that a rescan which exits on a block it could not notify resumes
