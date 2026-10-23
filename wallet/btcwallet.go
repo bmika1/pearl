@@ -220,16 +220,9 @@ func rpcClientConnectLoop(ctx context.Context,
 			}
 		})
 
-		clientStopped := make(chan struct{})
-		go func() {
-			select {
-			case <-ctx.Done():
-				chainClient.Stop()
-			case <-clientStopped:
-			}
-		}()
+		stopOnCancel := context.AfterFunc(ctx, chainClient.Stop)
 		chainClient.WaitForShutdown()
-		close(clientStopped)
+		stopOnCancel()
 
 		mu.Lock()
 		associateRPCClient = nil
@@ -270,9 +263,10 @@ func startChainClient(ctx context.Context, netDir string,
 		chainClient, err := startChainRPC(certs)
 		if err != nil {
 			log.Errorf("Unable to open connection to consensus RPC server: %v", err)
+			return nil, nil, err
 		}
 
-		return chainClient, func() {}, err
+		return chainClient, func() {}, nil
 	}
 
 	spvdb, err := walletdb.Create(

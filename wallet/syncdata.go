@@ -33,14 +33,10 @@ var syncDataFiles = []string{
 // isSyncDataCorrupt reports whether err from starting the chain client means
 // the stored chain data is unusable.
 func isSyncDataCorrupt(err error) bool {
-	var (
-		notFound *headerfs.ErrHeaderNotFound
-		pathErr  *fs.PathError
-	)
+	var notFound *headerfs.ErrHeaderNotFound
 
 	return errors.Is(err, headerfs.ErrHeaderStoreCorrupt) ||
-		errors.As(err, &notFound) ||
-		(errors.As(err, &pathErr) && pathErr.Op == "truncate")
+		errors.As(err, &notFound)
 }
 
 // resetSyncData moves the chain sync files in netDir aside as
@@ -54,15 +50,15 @@ func resetSyncData(netDir string) error {
 	suffix := fmt.Sprintf(".corrupt-%d", time.Now().Unix())
 	for _, name := range syncDataFiles {
 		path := filepath.Join(netDir, name)
-		if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
-			continue
-		}
-
-		if err := os.Rename(path, path+suffix); err != nil {
+		err := os.Rename(path, path+suffix)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+		case err != nil:
 			log.Errorf("Unable to reset the chain sync data: %v", err)
 			return err
+		default:
+			log.Infof("Moved %s to %s", path, path+suffix)
 		}
-		log.Infof("Moved %s to %s", path, path+suffix)
 	}
 
 	return nil
