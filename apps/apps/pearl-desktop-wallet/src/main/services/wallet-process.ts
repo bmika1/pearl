@@ -7,16 +7,13 @@ import path from 'path';
 import { WalletService } from './wallet-service/wallet-service';
 import { getCurrentNetworkConfig } from '../config/network-config';
 import { removeSetupFile, setupFileGeneration, untrackSetupFile, writeSetupFile } from './setup-file';
-import { shutdownProcess, terminatePids } from './process-shutdown';
+import { shutdownProcess } from './process-shutdown';
 
-// How long oyster gets to exit after it is asked to stop. Its shutdown is quick unless the wallet is in the middle
-// of a recovery batch.
+// Oyster exits within moments of being asked to, unless the wallet is in the middle of a recovery batch.
 const STOP_TIMEOUT_MS = 10_000;
-// Locking while the wallet recovers can't wait for that, so oyster only gets a moment before it is killed.
+// Locking during recovery can't wait that long.
 const FORCE_STOP_TIMEOUT_MS = 2_000;
-const TERMINATE_TIMEOUT_MS = 5_000;
-const KILL_TIMEOUT_MS = 5_000;
-const STRAY_TERMINATE_TIMEOUT_MS = 5_000;
+const SIGNAL_TIMEOUT_MS = 5_000;
 
 const binaryNameMap: Record<string, Record<string, string>> = {
   win32: {
@@ -440,38 +437,26 @@ class WalletProcess {
   }
 
   async stop(options: { force?: boolean } = {}) {
-    // A process that was spawned but isn't answering RPC yet must be stopped too, or it outlives the app and holds
-    // the wallet files and the RPC port.
+    // A process that is still starting up has to be stopped too, or it outlives the app and keeps the wallet files
+    // and the RPC port.
     const proc = this.process;
     if (!proc) {
       return { success: false as const, message: 'Wallet is not running' };
     }
 
     const stopTimeoutMs = options.force ? FORCE_STOP_TIMEOUT_MS : STOP_TIMEOUT_MS;
-    const outcome = await shutdownProcess(proc, {
+    const exited = await shutdownProcess(proc, {
       requestStop: () => this.walletService.stopDaemon(stopTimeoutMs),
       stopTimeoutMs,
-      terminateTimeoutMs: TERMINATE_TIMEOUT_MS,
-      killTimeoutMs: KILL_TIMEOUT_MS,
-      // A termination request meets the same slow shutdown the stop request just did.
+      signalTimeoutMs: SIGNAL_TIMEOUT_MS,
+      // A termination request would meet the same slow shutdown as the stop request.
       skipTerminate: options.force,
-      log,
     });
-    log.info(`Wallet process shutdown: ${outcome}`);
-
-    if (outcome === 'timeout') {
+    if (!exited) {
       return { success: false as const, message: 'Wallet process did not exit' };
     }
 
-    if (this.process === proc) {
-      this.isProcessRunning = false;
-      this.process = null;
-    }
-
-    return {
-      success: true as const,
-      message: options.force ? 'Wallet force stopped' : 'Wallet stopped successfully',
-    };
+    return { success: true as const, message: options.force ? 'Wallet force stopped' : 'Wallet stopped successfully' };
   }
 
   async killExistingWalletProcesses() {
@@ -502,11 +487,11 @@ class WalletProcess {
           }
 
           if (pids.length > 0) {
-            terminatePids(pids.map(Number).filter(Number.isInteger), {
-              timeoutMs: STRAY_TERMINATE_TIMEOUT_MS,
-              log,
-            }).finally(resolve);
-            return;
+            for (const pid of pids) {
+              try {
+                spawn('kill', ['-9', pid]);
+              } catch { }
+            }
           }
         }
         resolve();
