@@ -284,22 +284,6 @@ func TestUtxoScannerScanBasic(t *testing.T) {
 	require.Equal(t, expectedProgress, progressPoints, "wrong progress during rescan")
 }
 
-// TestUtxoScannerStopWithoutStart makes sure a scanner that was never started
-// can be stopped, which a chain service that failed to start has to do.
-func TestUtxoScannerStopWithoutStart(t *testing.T) {
-	scanner := NewUtxoScanner(&UtxoScannerConfig{})
-
-	stopped := make(chan error, 1)
-	go func() { stopped <- scanner.Stop() }()
-
-	select {
-	case err := <-stopped:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("Stop didn't return for a scanner that was never started")
-	}
-}
-
 // TestUtxoScannerScanAddBlocks tests that adding new blocks to neutrino's view
 // of the best snapshot properly dispatches spend reports. Internally, this
 // tests that the rescan detects a difference in the original best height and

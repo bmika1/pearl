@@ -794,8 +794,7 @@ func NewChainService(cfg Config) (_ *ChainService, retErr error) {
 		return nil, err
 	}
 
-	// An open handle blocks moving the header files aside on Windows, which
-	// recovering from a failed start needs.
+	// An open file can't be moved aside on Windows.
 	defer func() {
 		if retErr != nil {
 			s.closeHeaderStores()
@@ -1713,17 +1712,12 @@ func (s *ChainService) Stop() error {
 	return returnErr
 }
 
-// closeHeaderStores closes the files behind the header stores. Not every store
-// implementation owns a file, so Close isn't part of the store interfaces.
+// closeHeaderStores closes the header files. Not every store implementation
+// has one, so Close isn't part of the store interfaces.
 func (s *ChainService) closeHeaderStores() {
 	for _, store := range []interface{}{s.BlockHeaders, s.RegFilterHeaders} {
-		closer, ok := store.(io.Closer)
-		if !ok {
-			continue
-		}
-
-		if err := closer.Close(); err != nil {
-			log.Warnf("Unable to close header store: %v", err)
+		if closer, ok := store.(io.Closer); ok {
+			_ = closer.Close()
 		}
 	}
 }

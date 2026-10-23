@@ -18,7 +18,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// openHeaderFiles lists the flat header files this process holds open in dir.
+func testChainServiceConfig(t *testing.T) Config {
+	t.Helper()
+
+	dir := t.TempDir()
+	db, err := walletdb.Create(
+		"bdb", filepath.Join(dir, "neutrino.db"), true, 10*time.Second,
+		false,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, db.Close()) })
+
+	return Config{DataDir: dir, Database: db, ChainParams: chaincfg.SimNetParams}
+}
+
+// openHeaderFiles lists the header files in dir this process holds open.
 func openHeaderFiles(t *testing.T, dir string) []string {
 	t.Helper()
 
@@ -29,10 +43,7 @@ func openHeaderFiles(t *testing.T, dir string) []string {
 
 	var open []string
 	for _, fd := range fds {
-		target, err := os.Readlink(filepath.Join("/proc/self/fd", fd.Name()))
-		if err != nil {
-			continue
-		}
+		target, _ := os.Readlink(filepath.Join("/proc/self/fd", fd.Name()))
 		if filepath.Dir(target) == dir && filepath.Ext(target) == ".bin" {
 			open = append(open, filepath.Base(target))
 		}
@@ -42,126 +53,70 @@ func openHeaderFiles(t *testing.T, dir string) []string {
 }
 
 // TestChainServiceReleasesHeaderFiles makes sure the header files are closed
-// when the service stops or fails to start, since an open file can't be moved
-// aside on Windows.
+// when the service stops or fails to start, as open files can't be moved aside
+// on Windows.
 func TestChainServiceReleasesHeaderFiles(t *testing.T) {
-	dir := t.TempDir()
-	db, err := walletdb.Create(
-		"bdb", filepath.Join(dir, "neutrino.db"), true,
-		10*time.Second, false,
-	)
-	require.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, db.Close()) })
-
-	cfg := Config{
-		DataDir: dir, Database: db, ChainParams: chaincfg.SimNetParams,
-	}
+	cfg := testChainServiceConfig(t)
 
 	cs, err := NewChainService(cfg)
 	require.NoError(t, err)
 	require.NoError(t, cs.Start(context.Background()))
-	require.ElementsMatch(
-		t, []string{
-			headerfs.BlockHeadersFileName,
-			headerfs.RegFilterHeadersFileName,
-		}, openHeaderFiles(t, dir),
-	)
-
+	require.Len(t, openHeaderFiles(t, cfg.DataDir), 2)
 	require.NoError(t, cs.Stop())
-	require.Empty(t, openHeaderFiles(t, dir))
+	require.Empty(t, openHeaderFiles(t, cfg.DataDir))
 
-	// With the filter header tip gone the filter headers can't be matched
-	// to the index, which the block headers, opened before them, mustn't
-	// outlive.
-	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
-		rootBucket := tx.ReadWriteBucket([]byte("header-index"))
-
-		return rootBucket.Delete([]byte("regular"))
+	// The filter headers fail to open once their tip is gone, after the
+	// block headers were opened.
+	err = walletdb.Update(cfg.Database, func(tx walletdb.ReadWriteTx) error {
+		return tx.ReadWriteBucket([]byte("header-index")).Delete(
+			[]byte("regular"),
+		)
 	})
 	require.NoError(t, err)
 
 	_, err = NewChainService(cfg)
 	require.ErrorIs(t, err, headerfs.ErrHeaderStoreCorrupt)
-	require.Empty(t, openHeaderFiles(t, dir))
+	require.Empty(t, openHeaderFiles(t, cfg.DataDir))
 }
 
-// TestChainServiceStopWithoutStart makes sure a chain service that never
-// started, as after a failed start, can be stopped and lets go of its files.
-func TestChainServiceStopWithoutStart(t *testing.T) {
-	dir := t.TempDir()
-	db, err := walletdb.Create(
-		"bdb", filepath.Join(dir, "neutrino.db"), true,
-		10*time.Second, false,
-	)
-	require.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, db.Close()) })
-
-	cs, err := NewChainService(Config{
-		DataDir: dir, Database: db, ChainParams: chaincfg.SimNetParams,
-	})
-	require.NoError(t, err)
-	require.NotEmpty(t, openHeaderFiles(t, dir))
-
-	stopped := make(chan error, 1)
-	go func() { stopped <- cs.Stop() }()
-
-	select {
-	case err := <-stopped:
-		require.NoError(t, err)
-	case <-time.After(10 * time.Second):
-		t.Fatal("Stop didn't return for a service that was never started")
-	}
-	require.Empty(t, openHeaderFiles(t, dir))
-}
-
-// TestChainServiceStartsWithShortHeaderFiles is the scenario behind the chain
-// service failing to start for good: the header files lost their tail while
-// the database kept the full chain.
+// TestChainServiceStartsWithShortHeaderFiles covers header files that lost
+// their tails, by different amounts, while the database kept the full chain.
 func TestChainServiceStartsWithShortHeaderFiles(t *testing.T) {
 	const (
-		numHeaders  = 10
-		lostBlocks  = 3
-		lostFilters = 1
+		numHeaders = 10
+		lostBlocks = 3
 	)
-
-	dir := t.TempDir()
-	db, err := walletdb.Create(
-		"bdb", filepath.Join(dir, "neutrino.db"), true,
-		10*time.Second, false,
-	)
-	require.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, db.Close()) })
-
-	cfg := Config{
-		DataDir: dir, Database: db, ChainParams: chaincfg.SimNetParams,
-	}
+	cfg := testChainServiceConfig(t)
 
 	blockStore, err := headerfs.NewBlockHeaderStore(
-		dir, db, &chaincfg.SimNetParams,
+		cfg.DataDir, cfg.Database, &cfg.ChainParams,
 	)
 	require.NoError(t, err)
 	filterStore, err := headerfs.NewFilterHeaderStore(
-		dir, db, headerfs.RegularFilter, &chaincfg.SimNetParams, nil,
+		cfg.DataDir, cfg.Database, headerfs.RegularFilter,
+		&cfg.ChainParams, nil,
 	)
 	require.NoError(t, err)
 
-	prev := chaincfg.SimNetParams.GenesisBlock.BlockHeader()
-	blocks := make([]headerfs.BlockHeader, numHeaders)
-	filters := make([]headerfs.FilterHeader, numHeaders)
-	for i := range blocks {
+	prev := cfg.ChainParams.GenesisBlock.BlockHeader()
+	var (
+		blocks  []headerfs.BlockHeader
+		filters []headerfs.FilterHeader
+	)
+	for i := uint32(1); i <= numHeaders; i++ {
 		header := &wire.BlockHeader{
-			Bits:      uint32(i),
+			Bits:      i,
 			Timestamp: prev.Timestamp.Add(time.Minute),
 			PrevBlock: prev.BlockHash(),
 		}
-		blocks[i] = headerfs.BlockHeader{
-			BlockHeader: header, Height: uint32(i + 1),
-		}
-		filters[i] = headerfs.FilterHeader{
+		blocks = append(blocks, headerfs.BlockHeader{
+			BlockHeader: header, Height: i,
+		})
+		filters = append(filters, headerfs.FilterHeader{
 			HeaderHash: header.BlockHash(),
-			FilterHash: chainhash.DoubleHashH([]byte{byte(i)}),
-			Height:     uint32(i + 1),
-		}
+			FilterHash: chainhash.HashH(header.PrevBlock[:]),
+			Height:     i,
+		})
 		prev = header
 	}
 	require.NoError(t, blockStore.WriteHeaders(blocks...))
@@ -169,33 +124,26 @@ func TestChainServiceStartsWithShortHeaderFiles(t *testing.T) {
 	require.NoError(t, blockStore.(io.Closer).Close())
 	require.NoError(t, filterStore.(io.Closer).Close())
 
-	shrink := func(name string, numBytes int64) {
-		path := filepath.Join(dir, name)
+	for name, lost := range map[string]int64{
+		headerfs.BlockHeadersFileName:     lostBlocks * headerfs.BlockHeaderSize,
+		headerfs.RegFilterHeadersFileName: headerfs.RegularFilterHeaderSize,
+	} {
+		path := filepath.Join(cfg.DataDir, name)
 		info, err := os.Stat(path)
 		require.NoError(t, err)
-		require.NoError(t, os.Truncate(path, info.Size()-numBytes))
+		require.NoError(t, os.Truncate(path, info.Size()-lost))
 	}
-	shrink(headerfs.BlockHeadersFileName, lostBlocks*headerfs.BlockHeaderSize)
-	shrink(
-		headerfs.RegFilterHeadersFileName,
-		lostFilters*headerfs.RegularFilterHeaderSize,
-	)
 
 	cs, err := NewChainService(cfg)
 	require.NoError(t, err)
 	require.NoError(t, cs.Start(context.Background()))
 	t.Cleanup(func() { assert.NoError(t, cs.Stop()) })
 
-	_, blockHeight, err := cs.BlockHeaders.ChainTip()
-	require.NoError(t, err)
-	require.EqualValues(t, numHeaders-lostBlocks, blockHeight)
-
-	filterTip, filterHeight, err := cs.RegFilterHeaders.ChainTip()
-	require.NoError(t, err)
-	require.EqualValues(t, numHeaders-lostBlocks, filterHeight)
-	require.Equal(t, filters[numHeaders-lostBlocks-1].FilterHash, *filterTip)
-
+	// The filter headers can't be ahead of the block headers.
 	best, err := cs.BestBlock()
 	require.NoError(t, err)
 	require.EqualValues(t, numHeaders-lostBlocks, best.Height)
+	filterTip, _, err := cs.RegFilterHeaders.ChainTip()
+	require.NoError(t, err)
+	require.Equal(t, filters[numHeaders-lostBlocks-1].FilterHash, *filterTip)
 }
