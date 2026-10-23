@@ -12,13 +12,16 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/pearl-research-labs/pearl/spv/headerfs"
+	"github.com/pearl-research-labs/pearl/wallet/chain"
 	"github.com/pearl-research-labs/pearl/wallet/internal/cfgutil"
 	"github.com/pearl-research-labs/pearl/wallet/netparams"
+	"github.com/pearl-research-labs/pearl/wallet/waddrmgr"
 	"github.com/pearl-research-labs/pearl/wallet/wallet"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
 	"github.com/stretchr/testify/require"
@@ -58,8 +61,8 @@ func useTestChain(t *testing.T, appData string,
 	return netDir
 }
 
-// openFilesIn lists the files in dir this process holds open.
-func openFilesIn(t *testing.T, dir string) []string {
+// openSyncFiles lists the chain sync files in dir this process holds open.
+func openSyncFiles(t *testing.T, dir string) []string {
 	t.Helper()
 
 	fds, err := os.ReadDir("/proc/self/fd")
@@ -70,7 +73,9 @@ func openFilesIn(t *testing.T, dir string) []string {
 	var open []string
 	for _, fd := range fds {
 		target, err := os.Readlink(filepath.Join("/proc/self/fd", fd.Name()))
-		if err == nil && filepath.Dir(target) == dir {
+		if err == nil && filepath.Dir(target) == dir &&
+			slices.Contains(syncDataFiles, filepath.Base(target)) {
+
 			open = append(open, filepath.Base(target))
 		}
 	}
@@ -269,7 +274,7 @@ func TestStartSPVChainReleasesResources(t *testing.T) {
 		spv.close()
 		spv.close()
 
-		require.Empty(t, openFilesIn(t, netDir))
+		require.Empty(t, openSyncFiles(t, netDir))
 	}
 }
 
@@ -287,7 +292,7 @@ func TestStartSPVChainFailureReleasesResources(t *testing.T) {
 	require.ErrorIs(t, err, headerfs.ErrHeaderStoreCorrupt)
 	require.True(t, isSyncDataCorrupt(err))
 
-	require.Empty(t, openFilesIn(t, netDir))
+	require.Empty(t, openSyncFiles(t, netDir))
 }
 
 func runConnectLoop(ctx context.Context, loader *wallet.Loader) <-chan struct{} {
@@ -360,7 +365,7 @@ func TestConnectLoopResetsCorruptSyncData(t *testing.T) {
 	require.Equal(t, "wallet data", readFile(t, filepath.Join(netDir, "wallet.db")))
 	require.Equal(t, "notes", readFile(t, filepath.Join(netDir, "notes.txt")))
 	require.FileExists(t, filepath.Join(netDir, neutrinoDBName))
-	require.Empty(t, openFilesIn(t, netDir))
+	require.Empty(t, openSyncFiles(t, netDir))
 }
 
 // TestConnectLoopStopsWhileRetrying makes sure shutdown doesn't have to wait
@@ -388,4 +393,42 @@ func TestConnectLoopStopsWhileRetrying(t *testing.T) {
 	cancel()
 	waitStopped(t, done)
 	require.Less(t, time.Since(start), chainClientRetryMin)
+}
+
+// TestConnectLoopReconnectsAfterClientStops makes sure a chain client that goes
+// away is replaced by a new one on the same database, which used to fail with
+// a timeout because the previous attempt never let go of the database.
+func TestConnectLoopReconnectsAfterClientStops(t *testing.T) {
+	netDir := useTestChain(t, t.TempDir(), 3*time.Second)
+
+	prevScrypt := waddrmgr.DefaultScryptOptions
+	waddrmgr.DefaultScryptOptions = waddrmgr.FastScryptOptions
+	t.Cleanup(func() { waddrmgr.DefaultScryptOptions = prevScrypt })
+
+	loader := wallet.NewLoader(activeNet.Params, netDir, true, cfg.DBTimeout, 250)
+	w, err := loader.CreateNewWatchingOnlyWallet([]byte("public"), time.Now())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, loader.UnloadWallet()) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runConnectLoop(ctx, loader)
+
+	chainClient := func(not chain.Interface) func() bool {
+		return func() bool {
+			current := w.ChainClient()
+
+			return current != nil && current != not
+		}
+	}
+	require.Eventually(t, chainClient(nil), 20*time.Second, 20*time.Millisecond)
+	first := w.ChainClient()
+
+	first.Stop()
+
+	require.Eventually(t, chainClient(first), 20*time.Second, 20*time.Millisecond)
+
+	cancel()
+	waitStopped(t, done)
+	require.Empty(t, openSyncFiles(t, netDir))
 }
