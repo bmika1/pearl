@@ -78,19 +78,19 @@ use starky::batch_verifier::{BatchKnownColumns, batch_verify};
 use starky::config::StarkConfig;
 use starky::cross_table_lookup::CrossTableLookup;
 
-use super::blake3_stark::columns::{NUM_BLAKE3_PUBLIC_INPUTS, PI_HASH_JACKPOT};
-use super::blake3_stark::stark::{Blake3KnownInputs, Blake3Program, Blake3Stark, Blake3TraceInputs};
+use super::blake3_stark::columns::{NUM_BLAKE3_COLUMNS, NUM_BLAKE3_PUBLIC_INPUTS, PI_HASH_JACKPOT};
+use super::blake3_stark::stark::{Blake3KnownInputs, Blake3Program, Blake3Stark, Blake3TraceInputs, calloc_rows};
 use super::ctl::{NUM_ALL_TABLES, NUM_LUT_TABLES, NUM_TABLES, Table, all_cross_table_lookups, lut_inventories, lut_tables};
-use super::input_quant_stark::columns::{InputQuantColumnsView, NUM_INPUT_QUANT_PUBLIC_INPUTS};
+use super::input_quant_stark::columns::NUM_INPUT_QUANT_PUBLIC_INPUTS;
 use super::input_quant_stark::stark::{InputQuantProgram, InputQuantStark};
 use super::luts::stark::boxed_lut_stark;
 use super::luts::{LutChecker, lut_height, lut_preprocessed_data, lut_trace, num_precommitted_columns};
 use super::matmul_b200_stark::columns::NUM_MATMUL_PUBLIC_INPUTS;
 use super::matmul_b200_stark::{MatmulB200ColumnsView, MatmulStarkB200};
-use super::matmul_h100::{MatmulColumnsView, MatmulStarkH100};
+use super::matmul_h100::MatmulStarkH100;
 use super::scale_stark::columns::NUM_SCALE_PUBLIC_INPUTS;
-use super::scale_stark::stark::{ScaleProgram, ScaleRowTuple, ScaleStark};
-use super::xor_fold_stark::columns::{NUM_XOR_FOLD_PUBLIC_INPUTS, XorFoldColumnsView};
+use super::scale_stark::stark::{ScaleProgram, ScaleStark};
+use super::xor_fold_stark::columns::NUM_XOR_FOLD_PUBLIC_INPUTS;
 use super::xor_fold_stark::stark::{XorFoldProgram, XorFoldStark};
 use crate::v2::api::proof_utils::u32_field_array_to_hash;
 use crate::v4::api::primitives::Hash256;
@@ -333,57 +333,19 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulBackend<F, D> {
         }
     }
 
-    /// Generates the Matmul trace from InputQuant-bound operand data.
-    ///
-    /// Only the prover generates this trace. Verification checks its AIR and CTL
-    /// constraints; wrapper compilation uses [`Self::as_stark`].
-    ///
-    /// `a_codes` and `b_codes` are the post-noise FP8 E4M3 codes produced by InputQuant
-    /// and CTL-bound into Matmul. A is row-major (`h * k`); B is transposed/column-major
-    /// (`w * k`). `a_lambdas` and `b_lambdas` are InputQuant's deterministic integer
-    /// unpredictability scores, CTL-bound with the corresponding codes and used by
-    /// Matmul's skip/census logic.
-    #[allow(clippy::type_complexity)]
-    fn generate_trace(
-        &self,
-        a_codes: &[u8],
-        b_codes: &[u8],
-        a_lambdas: &[u64],
-        b_lambdas: &[u64],
-    ) -> (Vec<PolynomialValues<F>>, Vec<F>, Vec<u32>, Vec<u64>) {
+    /// The selected AIR's trace width (the joined fill's column destination count).
+    fn num_columns(&self) -> usize {
         match self {
-            Self::H100(stark) => {
-                let (rows, pis) = stark.generate_trace(a_codes, b_codes, a_lambdas, b_lambdas);
-                let (mut cell_words, mut cell_skips) = (vec![0u32; stark.h * stark.w], vec![0u64; stark.h * stark.w]);
-                for row in &rows {
-                    let value: &MatmulColumnsView<F> = row.borrow();
-                    if value.is_cell_final == F::ONE && value.is_padding == F::ZERO {
-                        let cell =
-                            value.out_row.to_canonical_u64() as usize * stark.w + value.out_col.to_canonical_u64() as usize;
-                        cell_words[cell] = (value.cell_result_f32_lo.to_canonical_u64()
-                            | (value.cell_result_f32_hi.to_canonical_u64() << 16))
-                            as u32;
-                        cell_skips[cell] = value.cell_skips.to_canonical_u64();
-                    }
-                }
-                (column_major(&rows), pis.to_vec(), cell_words, cell_skips)
-            }
-            Self::B200(stark) => {
-                let (rows, pis) = stark.generate_trace(a_codes, b_codes, a_lambdas, b_lambdas);
-                let (mut cell_words, mut cell_skips) = (vec![0u32; stark.h * stark.w], vec![0u64; stark.h * stark.w]);
-                for row in &rows {
-                    let value: &MatmulB200ColumnsView<F> = row.borrow();
-                    if value.is_cell_final == F::ONE && value.is_padding == F::ZERO {
-                        let cell =
-                            value.out_row.to_canonical_u64() as usize * stark.w + value.out_col.to_canonical_u64() as usize;
-                        cell_words[cell] = (value.cell_result_f32_lo.to_canonical_u64()
-                            | (value.cell_result_f32_hi.to_canonical_u64() << 16))
-                            as u32;
-                        cell_skips[cell] = value.cell_skips.to_canonical_u64();
-                    }
-                }
-                (column_major(&rows), pis.to_vec(), cell_words, cell_skips)
-            }
+            Self::H100(_) => super::matmul_h100::columns::NUM_MATMUL_COLUMNS,
+            Self::B200(_) => super::matmul_b200_stark::columns::NUM_MATMUL_B200_COLUMNS,
+        }
+    }
+
+    /// The geometry public inputs of the selected AIR.
+    fn public_inputs(&self) -> [F; NUM_MATMUL_PUBLIC_INPUTS] {
+        match self {
+            Self::H100(stark) => stark.public_inputs(),
+            Self::B200(stark) => stark.public_inputs(),
         }
     }
 
@@ -396,6 +358,47 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulBackend<F, D> {
         match self {
             Self::H100(stark) => stark,
             Self::B200(stark) => stark,
+        }
+    }
+
+    /// The joined-schedule trace fill: [`Self::generate_trace`]'s trace written
+    /// column-major straight into the caller's zeroed column buffers, with the cell
+    /// results (`cell_words`, `cell_skips`) returned by the cell workers instead of read
+    /// back out of the trace. Only the H100 backend has the direct fill; B200 falls
+    /// back to the row fill + transpose.
+    fn fill_columns(
+        &self,
+        a_codes: &[u8],
+        b_codes: &[u8],
+        a_lambdas: &[u64],
+        b_lambdas: &[u64],
+        cols: &mut [&mut [F]],
+    ) -> (Vec<u32>, Vec<u64>) {
+        match self {
+            Self::H100(stark) => stark.generate_columns(a_codes, b_codes, a_lambdas, b_lambdas, cols),
+            Self::B200(stark) => {
+                let (rows, _) = stark.generate_trace(a_codes, b_codes, a_lambdas, b_lambdas);
+                let trace = column_major(&rows);
+                // Scatter the transposed columns into the destination buffers (identical
+                // geometry on both backends).
+                for (dst, src) in cols.iter_mut().zip(trace) {
+                    dst.copy_from_slice(&src.values);
+                }
+                let mut cell_words = vec![0u32; stark.h * stark.w];
+                let mut cell_skips = vec![0u64; stark.h * stark.w];
+                for row in &rows {
+                    let value: &MatmulB200ColumnsView<F> = row.borrow();
+                    if value.is_cell_final == F::ONE && value.is_padding == F::ZERO {
+                        let cell =
+                            value.out_row.to_canonical_u64() as usize * stark.w + value.out_col.to_canonical_u64() as usize;
+                        cell_words[cell] = (value.cell_result_f32_lo.to_canonical_u64()
+                            | (value.cell_result_f32_hi.to_canonical_u64() << 16))
+                            as u32;
+                        cell_skips[cell] = value.cell_skips.to_canonical_u64();
+                    }
+                }
+                (cell_words, cell_skips)
+            }
         }
     }
 }
@@ -721,138 +724,115 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             "witness plane lengths differ from the statement's"
         );
 
-        // ---- InputQuant: the opened strips + the statement's noise codes. ----
+        // ---- Native InputQuant advice: per-group side witnesses plus the compact
+        // per-side outputs (noised fp8 codes, summand scores, per-matrix-row scale
+        // tuples) the downstream tables consume — one fused parallel build, shared
+        // by `Arc` across the dead padding groups. ----
         let as_int8 = |bytes: &[u8]| -> Vec<i8> { bytes.iter().map(|&b| b as i8).collect() };
         let le_codes = |bytes: &[u8]| -> Vec<u16> { bytes.chunks(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect() };
         let (a_int8, b_int8) = (as_int8(witness.a_values), as_int8(witness.b_values));
         let (a_scale_codes, b_scale_codes) = (le_codes(witness.a_scales), le_codes(witness.b_scales));
-        let (iq_rows, iq_pis) = timed!(
+        let iq_native = timed!(
             timing,
             "trace: input_quant",
-            self.input_quant.program.generate_trace::<F>(
-                &a_int8,
-                &a_scale_codes,
-                &self.a_noise,
-                &b_int8,
-                &b_scale_codes,
-                &self.b_noise,
+            self.input_quant
+                .program
+                .build_native(&a_int8, &a_scale_codes, &self.a_noise, &b_int8, &b_scale_codes, &self.b_noise,)
+        );
+
+        // ---- Joined trace generation. Given the native advice, the fills are
+        // independent (Scale's tuples and Matmul's codes/lambdas come from `iq_native`,
+        // not from the IQ trace) except the Matmul -> XorFold -> Blake3 chain: XorFold
+        // folds Matmul's cell results and Blake3's lottery block is XorFold's lane
+        // outputs. Two branches run overlapped across the rayon pool — (a) the IQ
+        // column fill and (b) the matmul column fill feeding XorFold and Blake3 in
+        // sequence — with Scale's fill (sub-millisecond) absorbing pool slack.
+        // Every column destination is a kernel-zeroed allocation: `alloc_zeroed`
+        // maps lazy zero pages, so no serial memset stands ahead of the fills and
+        // the padding rows need no explicit zeroing pass. ----
+        let iq_num_rows = self.input_quant.program.num_rows();
+        let mm_num_rows = self.matmul.num_rows();
+        let mut iq_cols = calloc_columns::<F>(super::input_quant_stark::columns::NUM_INPUT_QUANT_COLUMNS, iq_num_rows);
+        let mut mm_cols = calloc_columns::<F>(self.matmul.num_columns(), mm_num_rows);
+
+        timing.push("trace: joined-fill", log::Level::Debug);
+        let ((iq_pis,), (_, (scale_rows, scale_pis, xf_rows, xf_pis, b3_rows, b3_pis))) = {
+            // Column-slice handles: disjoint mutable borrows over the calloc'd columns,
+            // handed once to each fill (the fills write only disjoint rows).
+            let mut iq_slices: Vec<&mut [F]> = iq_cols.iter_mut().map(|c| c.as_mut_slice()).collect();
+            let mut mm_slices: Vec<&mut [F]> = mm_cols.iter_mut().map(|c| c.as_mut_slice()).collect();
+            plonky2_maybe_rayon::join(
+                || {
+                    self.input_quant.program.fill_columns::<F>(&iq_native, &mut iq_slices);
+                    (self.input_quant.program.public_inputs(),)
+                },
+                || {
+                    let ((cell_words, cell_skips), (scale_rows, scale_pis)) = plonky2_maybe_rayon::join(
+                        || {
+                            self.matmul.fill_columns(
+                                &iq_native.a_codes,
+                                &iq_native.b_codes,
+                                &iq_native.a_lambdas,
+                                &iq_native.b_lambdas,
+                                &mut mm_slices,
+                            )
+                        },
+                        || {
+                            self.scale
+                                .program
+                                .generate_trace::<F>(&iq_native.a_tuples, &iq_native.b_tuples)
+                        },
+                    );
+                    // ---- XorFold: fold Matmul's finished cell words into the lottery
+                    // lanes, returning the lane-final lottery words for Blake3's
+                    // jackpot block (same fold, no trace read-back). ----
+                    let (xf_rows, lottery_words) = self.xor_fold.program.generate_rows_and_lottery::<F>(&cell_words, &cell_skips);
+                    let xf_pis = [F::from_canonical_u64(self.xor_fold.program.skip_limit)];
+                    // ---- Blake3: the strip bytes and the folded lottery words under the
+                    // job schedule (native Phase A, then the parallel row fill). ----
+                    let inputs = Blake3TraceInputs {
+                        a_values: witness.a_values,
+                        a_scales: witness.a_scales,
+                        b_values: witness.b_values,
+                        b_scales: witness.b_scales,
+                        routing_words: witness.routing_words,
+                        offsets_words: witness.offsets_words,
+                        aux_msgs: witness.aux_msgs,
+                        aux_cvs: witness.aux_cvs,
+                        lottery_words,
+                        key_a: witness.key_a,
+                        key_b: witness.key_b,
+                        jackpot_key: witness.jackpot_key,
+                        a_hash_id: witness.a_hash_id,
+                        b_hash_id: witness.b_hash_id,
+                        routing_hash_id: witness.routing_hash_id,
+                        offsets_hash_id: witness.offsets_hash_id,
+                    };
+                    let schedule = self.blake3.program.native_schedule(&inputs);
+                    let mut b3_rows = calloc_rows::<F, NUM_BLAKE3_COLUMNS>(self.blake3.program.num_rows());
+                    let b3_pis = self.blake3.program.parallel_fill::<F>(&inputs, &schedule, &mut b3_rows);
+                    (
+                        (cell_words, cell_skips),
+                        (scale_rows, scale_pis, xf_rows, xf_pis, b3_rows, b3_pis),
+                    )
+                },
             )
-        );
-
-        // ---- Scale: one aggregate tuple per matrix row, exactly what InputQuant committed. ----
-        let (h, w, k) = (
-            self.input_quant.program.h,
-            self.input_quant.program.w,
-            self.input_quant.program.k,
-        );
-        let tuples = |b_side: bool| -> Vec<ScaleRowTuple> {
-            (0..if b_side { w } else { h })
-                .map(|g| {
-                    let v: &InputQuantColumnsView<F> = iq_rows[g * k + k - 1].borrow();
-                    if b_side {
-                        ScaleRowTuple {
-                            l2_frame_sum: v.block_l2_b.running_l2_frame_sum.to_canonical_u64(),
-                            frame_doubled_scale_exponent: v.block_l2_b.frame_doubled_scale_exponent.to_canonical_u64() as u32,
-                            max_abs: v.max_abs_b.to_canonical_u64() as u32,
-                            dead_count: v.dead_count_b.to_canonical_u64() as u32,
-                        }
-                    } else {
-                        ScaleRowTuple {
-                            l2_frame_sum: v.block_l2_a.running_l2_frame_sum.to_canonical_u64(),
-                            frame_doubled_scale_exponent: v.block_l2_a.frame_doubled_scale_exponent.to_canonical_u64() as u32,
-                            max_abs: v.max_abs_a.to_canonical_u64() as u32,
-                            dead_count: v.dead_count_a.to_canonical_u64() as u32,
-                        }
-                    }
-                })
-                .collect()
         };
-        let (scale_rows, scale_pis) = timed!(
-            timing,
-            "trace: scale",
-            self.scale.program.generate_trace::<F>(&tuples(false), &tuples(true))
-        );
-
-        // ---- Matmul: the noised fp8 codes and summand scores InputQuant committed (same
-        // element order). Live rows only: past a side's
-        // `h*k`/`w*k` elements the InputQuant trace carries the dead phantom fill. ----
-        let codes = |b_side: bool| -> Vec<u8> {
-            let live = if b_side { w * k } else { h * k };
-            iq_rows[..live]
-                .iter()
-                .map(|r| {
-                    let v: &InputQuantColumnsView<F> = r.borrow();
-                    (if b_side { v.code_noised_b } else { v.code_noised_a }).to_canonical_u64() as u8
-                })
-                .collect()
-        };
-        let lambdas = |b_side: bool| -> Vec<u64> {
-            let live = if b_side { w * k } else { h * k };
-            iq_rows[..live]
-                .iter()
-                .map(|r| {
-                    let v: &InputQuantColumnsView<F> = r.borrow();
-                    (if b_side { v.lambda_b } else { v.lambda_a }).to_canonical_u64()
-                })
-                .collect()
-        };
-        let (mat_trace, mat_pis, cell_words, cell_skips) = timed!(
-            timing,
-            "trace: matmul",
-            self.matmul
-                .generate_trace(&codes(false), &codes(true), &lambdas(false), &lambdas(true))
-        );
-
-        // ---- XorFold: fold Matmul's finished cell words into the lottery lanes. ----
-        let (xf_rows, xf_pis) = timed!(
-            timing,
-            "trace: xor_fold",
-            self.xor_fold.program.generate_trace::<F>(&cell_words, &cell_skips)
-        );
-
-        // ---- Blake3: the strip bytes and the folded lottery words under the job schedule. ----
-        let mut lottery_words = [0u32; 16];
-        for r in &xf_rows {
-            let v: &XorFoldColumnsView<F> = r.borrow();
-            if v.is_lane_final == F::ONE {
-                lottery_words[v.lane_id.to_canonical_u64() as usize] = (v.rotation_input_top13.to_canonical_u64()
-                    + (v.rotation_input_bottom19_limb_0.to_canonical_u64() << 13)
-                    + (v.rotation_input_bottom19_limb_1.to_canonical_u64() << 29))
-                    as u32;
-            }
-        }
-        let (b3_rows, b3_pis) = timed!(
-            timing,
-            "trace: blake3",
-            self.blake3.program.generate_trace::<F>(&Blake3TraceInputs {
-                a_values: witness.a_values,
-                a_scales: witness.a_scales,
-                b_values: witness.b_values,
-                b_scales: witness.b_scales,
-                routing_words: witness.routing_words,
-                offsets_words: witness.offsets_words,
-                aux_msgs: witness.aux_msgs,
-                aux_cvs: witness.aux_cvs,
-                lottery_words,
-                key_a: witness.key_a,
-                key_b: witness.key_b,
-                jackpot_key: witness.jackpot_key,
-                a_hash_id: witness.a_hash_id,
-                b_hash_id: witness.b_hash_id,
-                routing_hash_id: witness.routing_hash_id,
-                offsets_hash_id: witness.offsets_hash_id,
-            })
-        );
+        timing.pop();
+        let mat_pis = self.matmul.public_inputs().to_vec();
 
         // The proof ships the public inputs the witness generates (keys, roots, the geometry
         // and dead-limit slots, the lottery digest); the verifier pins every slot to its own
         // expectations in [`Self::verify`].
         let generated: [Vec<F>; NUM_TABLES] = [b3_pis.to_vec(), iq_pis.to_vec(), scale_pis.to_vec(), mat_pis, xf_pis.to_vec()];
 
-        // ---- Column-major traces, canonical order. ----
+        // ---- Column-major traces, canonical order. The IQ and Matmul traces' columns
+        // were filled in place; wrap the calloc'd vectors without a transpose pass. ----
+        let iq_trace: Vec<PolynomialValues<F>> = iq_cols.into_iter().map(PolynomialValues::new).collect();
+        let mat_trace: Vec<PolynomialValues<F>> = mm_cols.into_iter().map(PolynomialValues::new).collect();
         let mut traces: Vec<Vec<PolynomialValues<F>>> = vec![
             column_major(&b3_rows),
-            column_major(&iq_rows),
+            iq_trace,
             column_major(&scale_rows),
             mat_trace,
             column_major(&xf_rows),
@@ -1046,6 +1026,22 @@ fn column_major<F: RichField, const N: usize>(rows: &[[F; N]]) -> Vec<Polynomial
         });
     }
     cols.into_iter().map(PolynomialValues::new).collect()
+}
+
+/// One kernel-zeroed `Vec<F>` per trace column, `num_rows` long: `alloc_zeroed` maps lazy
+/// zero pages, so the allocation costs no serial memset and the fills' padding rows come
+/// pre-zeroed. The zeroed memory is a valid all-zero `[F]` for every supported field.
+fn calloc_columns<F: RichField>(num_columns: usize, num_rows: usize) -> Vec<Vec<F>> {
+    (0..num_columns)
+        .map(|_| {
+            let layout = std::alloc::Layout::array::<F>(num_rows).expect("column layout overflows");
+            // SAFETY: `alloc_zeroed` returns a valid, aligned, zeroed block of `layout` bytes.
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) } as *mut F;
+            // SAFETY: `ptr` covers exactly `num_rows` initialized (zero) elements and the
+            // allocation is uniquely owned here.
+            unsafe { Vec::from_raw_parts(ptr, num_rows, num_rows) }
+        })
+        .collect()
 }
 
 #[cfg(test)]
