@@ -141,6 +141,12 @@ impl<F: Field> Filter<F> {
                 .sum()
     }
 
+    /// Read-only access to the compiled terms (consumed by the LUT counting
+    /// fast path, which compiles a walk plan once per inventory).
+    pub fn parts(&self) -> (&[(Column<F>, Column<F>)], &[Column<F>]) {
+        (&self.products, &self.constants)
+    }
+
     /// Evaluates the filter on all rows, with the public inputs.
     /// Optimized for batch evaluation
     pub fn eval_all_rows_with_inputs(
@@ -559,6 +565,26 @@ impl<F: Field> Column<F> {
                 .map(|&s| public_inputs[s])
                 .sum::<F>()
             + self.constant
+    }
+
+    /// Read-only access to the compiled terms (consumed by the LUT counting
+    /// fast path, which compiles a walk plan once per inventory).
+    pub fn parts(
+        &self,
+    ) -> (
+        &[(usize, F)],
+        &[(usize, F)],
+        &[(usize, usize)],
+        &[usize],
+        F,
+    ) {
+        (
+            &self.linear_combination,
+            &self.next_row_linear_combination,
+            &self.public_input_scaled,
+            &self.public_input_offsets,
+            self.constant,
+        )
     }
 
     /// Evaluates the column on all rows, with the public inputs.

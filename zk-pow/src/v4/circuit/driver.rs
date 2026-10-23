@@ -34,8 +34,8 @@
 //! each table's inputs from its producer exactly like the consistency driver (InputQuant from
 //! the strips, Scale from InputQuant's group tuples, device-specific Matmul from the noised
 //! codes, XorFold from the cell results and census counts, Blake3 from the strip bytes and the folded lottery words),
-//! accumulates the committed-LUT multiplicities ([`LutChecker`] — which also re-checks that
-//! every instance is served by the committed tables), assembles the sixteen LUT traces,
+//! accumulates the committed-LUT multiplicities ([`LutChecker`]; serving validation is
+//! a debug/test-side concern owned by [`LutChecker::check_trace`]), assembles the sixteen LUT traces,
 //! observes the generated lottery digest through its `derive_statement_digest` callback
 //! (the Fiat-Shamir salt may depend on `J`), binds the returned `statement_digest`, and
 //! hands the batch to `starky::batch_prover::batch_prove`. The main tables' public
@@ -858,26 +858,49 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             column_major(&xf_rows),
         ];
 
-        // ---- Committed-LUT multiplicities: walk every AIR's inventory over its trace. The
-        // checker also re-validates that every instance is served by the committed tables,
-        // with per-instance errors — the prover fails fast instead of emitting an
-        // unbalanceable proof. ----
-        let mut checker = LutChecker::<F>::new(&self.lut_tables);
-        for (table, lookups) in lut_inventories::<F>(self.device(), &self.scale.program) {
-            let t = usize::from(table);
-            let label = format!("trace: lut-check {table:?}");
+        // ---- Committed-LUT multiplicities: walk every AIR's inventory over its trace,
+        // accumulating counts only — the serving validation is a debug/test-side
+        // concern ([`LutChecker::check_trace`], exercised by the consistency
+        // driver) and never changes the committed counts. The five walks run
+        // overlapped (one job per table, each internally row-parallel); each
+        // job owns its counters, and the results merge exactly (u64 addition
+        // commutes). ----
+        let inventories = lut_inventories::<F>(self.device(), &self.scale.program);
+        {
+            let label = "trace: lut-check".to_string();
             timing.push(&label, log::Level::Debug);
-            checker
-                .check_trace(&lookups, &traces[t], &generated[t], &format!("{table:?}"))
-                .map_err(|e| anyhow!(e))?;
+            let mut counters: Vec<LutChecker<F>> = inventories
+                .iter()
+                .map(|(_, lookups)| {
+                    let mut tables: Vec<_> = lookups.iter().map(|l| l.table).collect();
+                    tables.sort_unstable();
+                    tables.dedup();
+                    LutChecker::<F>::new(&tables)
+                })
+                .collect::<Vec<_>>();
+            {
+                use plonky2_maybe_rayon::{IndexedParallelIterator as _, MaybeParIterMut as _, ParallelIterator as _};
+                counters
+                    .par_iter_mut()
+                    .zip(&inventories)
+                    .try_for_each(|(counter, (table, lookups))| {
+                        let t = usize::from(*table);
+                        counter.count_trace(lookups, &traces[t], &generated[t], &format!("{table:?}"))
+                    })
+                    .map_err(|e: String| anyhow!(e))?;
+            }
+            let mut checker = LutChecker::<F>::new(&self.lut_tables);
+            for counter in &counters {
+                checker.multiplicities.merge(&counter.multiplicities);
+            }
+            for table in self.lut_tables {
+                let label = format!("trace: lut-trace {table:?}");
+                timing.push(&label, log::Level::Debug);
+                let trace = lut_trace::<F>(table, checker.multiplicities.table_columns(table));
+                timing.pop();
+                traces.push(trace);
+            }
             timing.pop();
-        }
-        for table in self.lut_tables {
-            let label = format!("trace: lut-trace {table:?}");
-            timing.push(&label, log::Level::Debug);
-            let trace = lut_trace::<F>(table, checker.multiplicities.table_columns(table));
-            timing.pop();
-            traces.push(trace);
         }
 
         // ---- The traces were assembled in canonical order, which is the batch order. ----
