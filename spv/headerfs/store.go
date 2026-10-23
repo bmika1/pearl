@@ -147,11 +147,10 @@ func (h *headerFile) truncateHeaders(numHeaders uint32,
 
 	// In order to truncate the file, we'll need to grab the absolute size
 	// of the file as it stands currently.
-	fileInfo, err := h.file.Stat()
+	fileSize, err := h.size()
 	if err != nil {
 		return err
 	}
-	fileSize := fileInfo.Size()
 
 	// Calculate the total bytes to truncate based on number of headers.
 	headerTypeSize, err := headerType.Size()
@@ -202,6 +201,16 @@ func (h *headerFile) Close() error {
 	return h.file.Close()
 }
 
+// size returns the size of the flat file in bytes.
+func (h *headerFile) size() (int64, error) {
+	info, err := h.file.Stat()
+	if err != nil {
+		return 0, err
+	}
+
+	return info.Size(), nil
+}
+
 // trimPartialRecord cuts a trailing partial header off the file, as appending after one would misalign every later
 // header, and returns the number of headers left.
 func (h *headerStore) trimPartialRecord() (uint32, error) {
@@ -209,12 +218,11 @@ func (h *headerStore) trimPartialRecord() (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	fileInfo, err := h.file.Stat()
+	size, err := h.size()
 	if err != nil {
 		return 0, err
 	}
 
-	size := fileInfo.Size()
 	if partial := size % int64(headerSize); partial != 0 {
 		size -= partial
 		if err := h.truncateToSize(size); err != nil {

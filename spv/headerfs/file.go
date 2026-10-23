@@ -17,11 +17,10 @@ type ErrHeaderNotFound struct {
 // appendRaw appends a new raw header to the end of the flat file.
 func (h *headerStore) appendRaw(header []byte) error {
 	// Roll back to the size, not the position: a file opened for appending is at position zero until its first write.
-	fileInfo, err := h.file.Stat()
+	size, err := h.size()
 	if err != nil {
 		return err
 	}
-	size := fileInfo.Size()
 
 	n, err := h.file.Write(header)
 	if err != nil {
