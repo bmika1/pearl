@@ -802,7 +802,7 @@ func TestFilterHeaderStoreCorrupt(t *testing.T) {
 }
 
 // TestTruncateHeadersBounds makes sure asking for more headers than the file
-// holds is refused instead of reaching the truncate syscall.
+// holds is refused before it reaches the truncate syscall.
 func TestTruncateHeadersBounds(t *testing.T) {
 	cleanUp, _, dir, bhs, err := createTestBlockHeaderStore()
 	require.NoError(t, err)
@@ -817,4 +817,45 @@ func TestTruncateHeadersBounds(t *testing.T) {
 
 	require.NoError(t, bhs.truncateHeaders(1, Block))
 	require.Zero(t, fileSize(t, path))
+}
+
+// TestSetTipAtHeightNeedsOneHeader makes sure a tip is only pointed at a height
+// that has exactly one header, as picking either of two would be a guess.
+func TestSetTipAtHeightNeedsOneHeader(t *testing.T) {
+	cleanUp, hIndex, err := createTestIndex(t)
+	require.NoError(t, err)
+	defer cleanUp()
+
+	put := func(seed string, height uint32) chainhash.Hash {
+		entry := headerEntry{hash: chainhash.HashH([]byte(seed)), height: height}
+		err := walletdb.Update(hIndex.db, func(tx walletdb.ReadWriteTx) error {
+			return putHeaderEntry(tx.ReadWriteBucket(indexBucket), entry)
+		})
+		require.NoError(t, err)
+
+		return entry.hash
+	}
+
+	only := put("only", 3)
+	put("first", 5)
+	put("second", 5)
+
+	require.NoError(t, hIndex.setTipAtHeight(3))
+	tip, tipHeight, err := hIndex.chainTip()
+	require.NoError(t, err)
+	require.EqualValues(t, 3, tipHeight)
+	require.Equal(t, only, *tip)
+
+	err = hIndex.setTipAtHeight(5)
+	require.ErrorIs(t, err, ErrHeaderStoreCorrupt)
+	require.ErrorContains(t, err, "multiple headers")
+
+	err = hIndex.setTipAtHeight(9)
+	require.ErrorIs(t, err, ErrHeaderStoreCorrupt)
+	require.ErrorIs(t, err, ErrHeightNotFound)
+
+	// A failed attempt leaves the tip where it was.
+	_, tipHeight, err = hIndex.chainTip()
+	require.NoError(t, err)
+	require.EqualValues(t, 3, tipHeight)
 }
