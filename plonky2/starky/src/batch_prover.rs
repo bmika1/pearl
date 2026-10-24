@@ -32,7 +32,7 @@ use crate::batch_verifier::BatchKnownColumns;
 use crate::config::StarkConfig;
 use crate::constraint_consumer::ConstraintConsumer;
 use crate::cross_table_lookup::{
-    cross_table_lookup_data, get_ctl_auxiliary_polys, CrossTableLookup, CtlCheckVars, CtlData,
+    cross_table_lookup_data, take_ctl_auxiliary_polys, CrossTableLookup, CtlCheckVars, CtlData,
 };
 use crate::get_challenges::get_dummy_polys;
 use crate::lookup::{get_grand_product_challenge_set, lookup_helper_columns, LookupCheckVars};
@@ -68,6 +68,13 @@ pub struct BatchStarkPreprocessedVerifierData<
     pub cap: MerkleCap<F, C::Hasher>,
     /// For each table, the sorted indices of its preprocessed columns.
     pub columns_per_table: Vec<Vec<usize>>,
+}
+
+fn ctl_data_of_fn<'a, F: Field, const N: usize>(
+    t: usize,
+    ctl_data: &'a Option<[CtlData<F>; N]>,
+) -> Option<&'a CtlData<'a, F>> {
+    ctl_data.as_ref().map(|d| &d[t])
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
@@ -398,7 +405,7 @@ where
         has_aux.then(|| get_grand_product_challenge_set(&mut challenger, config.num_challenges));
 
     // Compute the CTL data of every table.
-    let ctl_data_per_table: Option<[CtlData<F>; N]> =
+    let mut ctl_data_per_table: Option<[CtlData<F>; N]> =
         (!cross_table_lookups.is_empty()).then(|| {
             timed!(
                 timing,
@@ -422,7 +429,9 @@ where
             debug_assert_eq!(ctl_data[t].zs_columns.len(), layout.num_ctl_zs[t]);
         }
     }
-    let ctl_data_of = |t: usize| ctl_data_per_table.as_ref().map(|d| &d[t]);
+    // CTL data accessor for the two consumers below; kept as a free function
+    // because the borrow needs to tie to the caller's argument lifetime.
+    let ctl_data_of = ctl_data_of_fn;
 
     // Lookup challenges, shared by every table using lookups.
     let lookup_challenges: Option<Vec<F>> = challenge_set
@@ -435,6 +444,9 @@ where
     };
 
     // Compute the auxiliary polynomials (lookup helpers, then CTL helpers and Zs) of each table.
+    // Each table's CTL polys are drained (moved) from its `CtlData` — an O(1)
+    // buffer transfer; the lookup helper columns within a table parallelize
+    // over (lookup, challenge) pairs.
     let aux_polys_per_table: Vec<Vec<PolynomialValues<F>>> = timed!(
         timing,
         "compute auxiliary polynomials",
@@ -461,7 +473,9 @@ where
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                if let Some(ctl_polys) = get_ctl_auxiliary_polys(ctl_data_of(t)) {
+                if let Some(ctl_polys) =
+                    take_ctl_auxiliary_polys(ctl_data_per_table.as_mut().map(|d| &mut d[t]))
+                {
                     aux.extend(ctl_polys);
                 }
                 debug_assert_eq!(aux.len(), layout.num_aux_polys(t));
@@ -525,7 +539,7 @@ where
         // Dummy CTL check vars: real challenges/columns/filters, dummy evaluations.
         let num_lookup_columns = layout.num_lookup_columns[t];
         let total_num_ctl_helpers = layout.num_ctl_helpers[t];
-        let dummy_ctl_vars = ctl_data_of(t).map(|data| {
+        let dummy_ctl_vars = ctl_data_of(t, &ctl_data_per_table).map(|data| {
             let mut start_index = 0;
             data.zs_columns
                 .iter()
@@ -612,7 +626,7 @@ where
                         (layout.num_aux_polys(t) > 0).then(|| role_oracle(BatchRole::Auxiliary, t)),
                         lookup_challenges_of(t),
                         &lookups_per_table[t],
-                        ctl_data_of(t),
+                        ctl_data_of(t, &ctl_data_per_table),
                         &public_inputs[t],
                         alphas.clone(),
                         config,

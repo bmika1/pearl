@@ -38,7 +38,7 @@ use core::fmt::Debug;
 use anyhow::{ensure, Result};
 use hashbrown::HashMap;
 use itertools::Itertools;
-use plonky2::field::batch_util::{batch_add_inplace, batch_multiply_inplace};
+use plonky2::field::batch_util::batch_add_inplace;
 use plonky2::field::extension::{Extendable, FieldExtension};
 use plonky2::field::packed::PackedField;
 use plonky2::field::polynomial::PolynomialValues;
@@ -264,6 +264,33 @@ impl<F: Field> CtlData<'_, F> {
         res
     }
 
+    /// Moves the CTL helper and Z polynomials' values out, leaving the table's
+    /// `CtlData` with its metadata (challenges, columns, filters) and helper
+    /// counts. The committed-oracle consumers of `CtlData` never read the
+    /// value polys — they read them back from the auxiliary commitment — so
+    /// proving pipelines that own their `CtlData` can hand the values to the
+    /// auxiliary-polynomial assembly without a multi-gigabyte deep copy.
+    /// The helper *counts* (`zs_columns[i].helper_columns.len()`) are
+    /// preserved for layout math downstream.
+    pub(crate) fn take_ctl_polys(&mut self) -> Vec<PolynomialValues<F>> {
+        let num_helpers: usize = self
+            .zs_columns
+            .iter()
+            .map(|z| z.helper_columns.len())
+            .sum();
+        let num_zs = self.zs_columns.len();
+        let mut res = Vec::with_capacity(num_helpers + num_zs);
+        for z in &mut self.zs_columns {
+            for pv in &mut z.helper_columns {
+                res.push(core::mem::take(pv));
+            }
+        }
+        for z in &mut self.zs_columns {
+            res.push(core::mem::take(&mut z.z));
+        }
+        res
+    }
+
     /// Returns all the Z cross-table-lookup polynomials.
     pub(crate) fn ctl_z_polys(&self) -> Vec<PolynomialValues<F>> {
         let mut res = Vec::with_capacity(self.zs_columns.len());
@@ -324,6 +351,17 @@ pub(crate) fn get_ctl_auxiliary_polys<F: Field>(
         ctl_polys.extend(data.ctl_z_polys());
         ctl_polys
     })
+}
+
+/// Move-based variant of [`get_ctl_auxiliary_polys`] for proving pipelines
+/// that own their [`CtlData`]: the helper and Z polynomials' buffers are
+/// moved into the auxiliary-polynomial assembly instead of cloned, and the
+/// `CtlData` retains its metadata and helper counts for downstream layout
+/// math. Functionally identical to the clone-based variant.
+pub(crate) fn take_ctl_auxiliary_polys<F: Field>(
+    ctl_data: Option<&mut CtlData<F>>,
+) -> Option<Vec<PolynomialValues<F>>> {
+    ctl_data.map(CtlData::take_ctl_polys)
 }
 
 /// Generates all the cross-table lookup data, for all tables.
@@ -457,13 +495,12 @@ pub(crate) fn cross_table_lookup_data<'a, F: RichField, const D: usize, const N:
             partial_sums_with_evals(&ge.columns, &ge.filters, work.challenge, constraint_degree)
         })
         .collect::<Vec<_>>();
-
     let mut ctl_data_per_table = [0; N].map(|_| CtlData::default());
-    for (work, helpers_zs) in works.into_iter().zip(results) {
-        let num_helpers = helpers_zs.len() - 1;
+    for (work, mut helpers_zs) in works.into_iter().zip(results) {
+        let z = helpers_zs.pop().expect("partial sums always return a Z poly");
         ctl_data_per_table[work.table].zs_columns.push(CtlZData {
-            helper_columns: helpers_zs[..num_helpers].to_vec(),
-            z: helpers_zs[num_helpers].clone(),
+            helper_columns: helpers_zs,
+            z,
             challenge: work.challenge,
             columns: work.columns,
             filter: work.filter,
@@ -485,6 +522,11 @@ pub(crate) fn cross_table_lookup_data<'a, F: RichField, const D: usize, const N:
 ///
 /// The sum is updated: `s += \sum h_i`, and is pushed to the vector of partial sums `z`.
 /// Returns the helper columns and `z`.
+///
+/// Rows are processed in parallel across the instance's row range: the per-instance
+/// `combine` map and the batch inversion both parallelize over row chunks, so a
+/// single work over a 2^22-row table can use the whole rayon pool even when few
+/// CTL works exist.
 fn partial_sums_with_evals<F: Field>(
     columns: &[Vec<Vec<F>>],
     filters: &[Vec<F>],
@@ -495,31 +537,51 @@ fn partial_sums_with_evals<F: Field>(
     debug_assert!(columns.iter().flatten().all(|c| c.len() == degree));
 
     let group = constraint_degree.checked_sub(1).unwrap_or(1);
-    let mut z = Vec::with_capacity(degree);
+
+    // Row-parallel combine+inverse+filter for one instance: splits `degree`
+    // rows into chunks, computes each chunk's `combine` (a pure map) into its
+    // slice of the single preallocated output buffer, inverts it with an
+    // independent Montgomery trick, and multiplies by the filter.
+    // Functionally identical to the serial version: the Montgomery trick is
+    // exact for any chunking, and the chunks are independent row ranges.
+    let combine_inverse_filter_into =
+        |instance: &[Vec<F>], filter: &[F], out: &mut [F]| {
+            let num_chunks = if out.len() >= (1 << 15) { 16 } else { 1 };
+            let chunk_len = out.len().div_ceil(num_chunks);
+            out.par_chunks_mut(chunk_len).enumerate().for_each(|(ci, combined)| {
+                let lo = ci * chunk_len;
+                if instance.len() == 1 {
+                    for (o, &x) in combined.iter_mut().zip(&instance[0][lo..]) {
+                        *o = x + challenge.gamma;
+                    }
+                } else {
+                    for (d, o) in combined.iter_mut().enumerate() {
+                        *o = challenge
+                            .combine_base(instance.iter().map(|vals| vals[lo + d]));
+                    }
+                }
+                let inverse = F::batch_multiplicative_inverse(combined);
+                combined.copy_from_slice(&inverse);
+                for (o, &f) in combined.iter_mut().zip(&filter[lo..]) {
+                    *o *= f;
+                }
+            });
+        };
 
     let chunks = (0..columns.len()).step_by(group);
     let mut helper_columns: Vec<PolynomialValues<F>> = Vec::new();
+    // Reused across instances of every chunk: one buffer of `degree` values,
+    // written by the row-parallel combine+inverse+filter helper.
+    let mut combined: Vec<F> = vec![F::ZERO; degree];
     for chunk_start in chunks {
         let mut acc: Option<Vec<F>> = None;
         for (instance, filter) in columns[chunk_start..(chunk_start + group).min(columns.len())]
             .iter()
             .zip(&filters[chunk_start..(chunk_start + group).min(filters.len())])
         {
-            // combine([x]) = x + gamma when the instance's column has a
-            // single element; otherwise Horner-style beta reduction.
-            let mut combined: Vec<F> = if instance.len() == 1 {
-                let mut v = instance[0].clone();
-                v.iter_mut().for_each(|x| *x += challenge.gamma);
-                v
-            } else {
-                (0..degree)
-                    .map(|d| challenge.combine_base(instance.iter().map(|vals| vals[d])))
-                    .collect()
-            };
-            combined = F::batch_multiplicative_inverse(&combined);
-            batch_multiply_inplace(&mut combined, filter);
+            combine_inverse_filter_into(instance, filter, &mut combined);
             acc = Some(match acc {
-                None => combined,
+                None => combined.clone(),
                 Some(mut a) => {
                     batch_add_inplace(&mut a, &combined);
                     a
@@ -531,17 +593,28 @@ fn partial_sums_with_evals<F: Field>(
         }
     }
 
-    let x = helper_columns
-        .iter()
-        .map(|col| col.values[degree - 1])
-        .sum::<F>();
+    // Z suffix sums: `z[degree-1] = sum of the last helper values`, then each
+    // earlier `z[i] = z[i+1] + sum_h h[i]`. The per-row helper sums parallelize
+    // over row chunks; the suffix scan itself stays serial (a prefix-sum
+    // dependency chain too short to matter at these sizes).
+    let num_helpers = helper_columns.len();
+    let per_row_sums: Vec<F> = if num_helpers == 1 {
+        helper_columns[0].values.clone()
+    } else {
+        (0..degree)
+            .into_par_iter()
+            .with_min_len(1024)
+            .map(|i| helper_columns.iter().map(|col| col.values[i]).sum::<F>())
+            .collect()
+    };
+    let mut z = Vec::with_capacity(degree);
+    let x = per_row_sums[degree - 1];
     z.push(x);
-
     for i in (0..degree - 1).rev() {
-        let x = helper_columns.iter().map(|col| col.values[i]).sum::<F>();
-        z.push(z[z.len() - 1] + x);
+        z.push(z[z.len() - 1] + per_row_sums[i]);
     }
     z.reverse();
+
     if columns.len() > 1 {
         helper_columns.push(z.into());
     } else {
