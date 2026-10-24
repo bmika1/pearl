@@ -611,10 +611,14 @@ where
     };
 
     // Compute and commit to the quotient polynomials of all tables.
+    // Tables' quotient evaluations read only their own rows through the
+    // shared immutable oracles, so the table loop itself parallelizes; big
+    // tables' row loops then subdivide across the same pool.
     let quotient_chunks_per_table: Vec<Option<Vec<PolynomialCoeffs<F>>>> = timed!(
         timing,
         "compute quotient polynomials",
         (0..N)
+            .into_par_iter()
             .map(|t| {
                 let quotient_polys =
                     compute_batch_quotient_polys::<F, <F as Packable>::Packing, C, D>(
