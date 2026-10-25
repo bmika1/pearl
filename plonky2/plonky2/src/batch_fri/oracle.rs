@@ -42,6 +42,96 @@ where
     C::Hasher::hash_no_pad_batch(rows)
 }
 
+/// `(self - self(z)) / (X - z)` with a blocked parallel scan.
+///
+/// The classic Horner recurrence `q[i] = q[i+1] * z + c[i+1]` (with
+/// `q[n-1] = c[n-1]`) is a linear scan over the whole coefficient array;
+/// the deg-22 openings instances run it twice over 2^22 extension
+/// coefficients on the critical path. Blocked scan (same shape as the CTL
+/// Z-suffix scan): the scan flows from high indices down, and each block's
+/// out-state is linear in its in-state (`out = in * z^len + L` where `L` is
+/// the block's own Horner sum), so block-local sums evaluate in parallel,
+/// a serial pass combines the `#blocks` carries, and the blocks then run
+/// their recurrences in parallel.
+///
+/// Value-identical to `PolynomialCoeffs::divide_by_linear`: the same
+/// `acc = acc * z + c` recurrence over the same coefficients, evaluated as
+/// independent segments.
+pub(crate) fn divide_by_linear_par<FE: Field>(
+    coeffs: &[FE],
+    z: FE,
+) -> PolynomialCoeffs<FE> {
+    let n = coeffs.len();
+    if n == 0 {
+        return PolynomialCoeffs::empty();
+    }
+    // Below the block size the serial Horner scan is optimal (and the
+    // small-input path is exactly the original implementation).
+    const BLOCK: usize = 1 << 14;
+    if n <= BLOCK {
+        let mut bs = coeffs
+            .iter()
+            .rev()
+            .scan(FE::ZERO, |acc, &c| {
+                *acc = *acc * z + c;
+                Some(*acc)
+            })
+            .collect::<Vec<_>>();
+        bs.pop();
+        bs.reverse();
+        return PolynomialCoeffs::new(bs);
+    }
+    let num_blocks = n.div_ceil(BLOCK);
+    let block_len = |b: usize| ((b + 1) * BLOCK).min(n) - b * BLOCK;
+
+    // Per-block local Horner walk `L_b`: the state the block produces from
+    // its own coefficients alone (entry state zero), processing descending
+    // from the block's top index — the same direction as the serial scan.
+    let locals: Vec<FE> = (0..num_blocks)
+        .into_par_iter()
+        .map(|b| {
+            let lo = b * BLOCK;
+            let hi = ((b + 1) * BLOCK).min(n);
+            let mut s = FE::ZERO;
+            for i in (lo..hi).rev() {
+                s = s * z + coeffs[i];
+            }
+            s
+        })
+        .collect();
+
+    // Serial carry pass down the blocks (top to bottom): with `len_b` the
+    // block's length, `out_b = in_b * z^{len_b} + L_b`, and `out_b` feeds the
+    // block below as its entry state. The top block's entry state is zero.
+    let mut in_state = vec![FE::ZERO; num_blocks];
+    let mut carry = FE::ZERO;
+    for b in (0..num_blocks).rev() {
+        in_state[b] = carry;
+        carry = carry * z.exp_u64(block_len(b) as u64) + locals[b];
+    }
+
+    // Per-block recurrences in parallel: `q[hi-1] = in_b`, then
+    // `q[i] = q[i+1] * z + c[i]` descending through the block (the original
+    // scan's recurrence, restricted to the block).
+    let mut q = vec![FE::ZERO; n - 1];
+    q.par_chunks_mut(BLOCK)
+        .enumerate()
+        .for_each(|(b, out)| {
+            let lo = b * BLOCK;
+            let hi = ((b + 1) * BLOCK).min(n);
+            let mut s = in_state[b];
+            for i in (lo..hi).rev() {
+                if i < n - 1 {
+                    out[i - lo] = s;
+                }
+                if i > lo {
+                    s = s * z + coeffs[i];
+                }
+            }
+        });
+    PolynomialCoeffs::new(q)
+}
+
 /// Represents a batch FRI oracle, i.e. a batch of polynomials with different degrees which have
 /// been Merkle-ized in a [`BatchMerkleTree`].
 #[derive(Eq, PartialEq, Debug)]
@@ -271,8 +361,14 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .into_par_iter()
             .enumerate()
             .map(|(i, instance)| {
-                // Final low-degree polynomial that goes into FRI.
-                let mut final_poly = PolynomialCoeffs::empty();
+                // Final low-degree polynomial that goes into FRI: the sum of
+                // the batches' quotient polys. All instances share the full
+                // degree `1 << degree_bits[i]` (the quotient polys are padded
+                // to it), so preallocate once and accumulate each batch's
+                // quotient in parallel instead of growing a fresh poly by
+                // serial `+=` per batch.
+                let degree = 1 << degree_bits[i];
+                let mut final_poly = PolynomialCoeffs::<F::Extension>::zero(degree);
 
                 // Each batch consists of an opening point `z` and polynomials `{f_j}_j` to be
                 // opened at that point. Per [`AlphaRun`], the instance's polynomial is
@@ -282,9 +378,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // There are usually two batches for the openings at `zeta` and `g * zeta`.
                 for (k, FriBatchInfo { point, polynomials }) in instance.batches.iter().enumerate()
                 {
-                    let mut composition_poly = PolynomialCoeffs::empty();
-                    for run in runs.iter().filter(|r| r.instance == i && r.batch == k) {
-                        // Collect the coefficients of the run's polynomials.
+                    // All of the batch's runs reduce over full-degree base
+                    // polys, so the composition is a fixed-width weighted
+                    // sum: allocate once and accumulate each run's reduced
+                    // poly as a parallel axpy over coefficients (the serial
+                    // `+=` grow-loop rewalked the whole array per run).
+                    let batch_runs: Vec<&crate::batch_fri::AlphaRun> = runs
+                        .iter()
+                        .filter(|r| r.instance == i && r.batch == k)
+                        .collect();
+                    let mut composition_poly = PolynomialCoeffs::<F::Extension>::zero(degree);
+                    for run in batch_runs {
                         let polys_coeff = polynomials[run.flat_start..run.flat_start + run.len]
                             .iter()
                             .map(|fri_poly| {
@@ -295,14 +399,23 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         let mut reduced =
                             ReducingFactor::new(alpha).reduce_polys_base(&polys_coeff);
                         reduced *= alpha.exp_u64(run.alpha_offset as u64);
-                        composition_poly += reduced;
+                        debug_assert_eq!(reduced.len(), degree);
+                        composition_poly
+                            .coeffs
+                            .par_iter_mut()
+                            .zip(&reduced.coeffs)
+                            .for_each(|(c, &r)| *c += r);
                     }
-                    let mut quotient = composition_poly.divide_by_linear(*point);
-                    quotient.coeffs.push(F::Extension::ZERO); // pad back to power of two
-                    final_poly += quotient;
+                    let quotient = divide_by_linear_par(&composition_poly.coeffs, *point);
+                    debug_assert_eq!(quotient.len() + 1, degree);
+                    final_poly
+                        .coeffs
+                        .par_iter_mut()
+                        .zip(&quotient.coeffs)
+                        .for_each(|(f, &q)| *f += q);
                 }
 
-                assert_eq!(final_poly.len(), 1 << degree_bits[i]);
+                assert_eq!(final_poly.len(), degree);
                 let lde_final_poly = final_poly.lde(fri_params.config.rate_bits);
                 let lde_final_values = coset_fft_par(&lde_final_poly, F::coset_shift().into());
                 (lde_final_poly, lde_final_values)
@@ -792,5 +905,23 @@ mod test {
         data.verify(proof.clone())?;
 
         Ok(())
+    }
+
+    /// The blocked parallel linear division must be value-identical to the
+    /// serial `PolynomialCoeffs::divide_by_linear` across sizes (including
+    /// non-power-of-two lengths and the block boundary).
+    #[test]
+    fn divide_by_linear_par_matches_serial() {
+        use plonky2_field::polynomial::PolynomialCoeffs as PC;
+
+        const BLOCK: usize = 1 << 14;
+        for &n in &[0usize, 1, 2, 3, BLOCK - 1, BLOCK, BLOCK + 1, 3 * BLOCK + 7] {
+            let coeffs = F::rand_vec(n);
+            let z = F::rand();
+            let serial = PC::new(coeffs.clone()).divide_by_linear(z);
+            let par = divide_by_linear_par(&coeffs, z);
+            assert_eq!(serial.len(), par.len(), "len mismatch at n={n}");
+            assert_eq!(serial.coeffs, par.coeffs, "value mismatch at n={n}");
+        }
     }
 }
