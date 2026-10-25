@@ -354,11 +354,11 @@ impl Fp8WrapperCircuits {
             system.config(),
         )?;
         pw.set_hash_target(self.known_digest_target, statement_digest_to_hash_out(statement_digest))?;
-        let stage1_proof = timed!(timing, "prove the stage-1 wrapper", self.stage1.prove(pw))?;
+        let stage1_proof = timed!(timing, "prove the stage-1 wrapper", self.stage1.prove_with_timing(pw, timing))?;
 
         let mut pw = PartialWitness::new();
         pw.set_proof_with_pis_target(&self.stage1_proof_target, &stage1_proof)?;
-        timed!(timing, "prove the stage-2 (ZK) wrapper", self.stage2.prove(pw))
+        timed!(timing, "prove the stage-2 (ZK) wrapper", self.stage2.prove_with_timing(pw, timing))
     }
 
     /// Warmup variant of [`Self::prove`], discarding the result: proves both stages
