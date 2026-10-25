@@ -266,20 +266,34 @@ where
     // per-table copy of just those columns, with cheap placeholders elsewhere
     // (mirrors `create_sparse_trace_for_lookups` in `prover.rs`).
     let lookups_per_table: Vec<_> = (0..N).map(|t| starks[t].lookups()).collect();
+    // The kept columns are large (the biggest tables' columns run to
+    // hundreds of MB in total), and the clone is pure memcpy: parallelize
+    // over columns — disjoint destinations, immutable sources — so the copy
+    // saturates memory bandwidth instead of running on one core. The
+    // keep-decision is precomputed as a flag vector so the parallel loop
+    // does one indexed load per column.
+    let keep_flags_per_table: Vec<Vec<bool>> = (0..N)
+        .map(|t| {
+            let mut keep: HashSet<usize> = lookups_per_table[t]
+                .iter()
+                .flat_map(|lookup| lookup.all_column_indices())
+                .collect();
+            for ctl in cross_table_lookups {
+                keep.extend(ctl.column_indices_of_table(t));
+            }
+            keep.insert(0); // Always include column 0 for degree.
+            (0..trace_poly_values[t].len())
+                .map(|c| keep.contains(&c))
+                .collect()
+        })
+        .collect();
     let sparse_traces: [Vec<PolynomialValues<F>>; N] = core::array::from_fn(|t| {
-        let mut keep: HashSet<usize> = lookups_per_table[t]
-            .iter()
-            .flat_map(|lookup| lookup.all_column_indices())
-            .collect();
-        for ctl in cross_table_lookups {
-            keep.extend(ctl.column_indices_of_table(t));
-        }
-        keep.insert(0); // Always include column 0 for degree.
+        let keep_flags = &keep_flags_per_table[t];
         trace_poly_values[t]
-            .iter()
+            .par_iter()
             .enumerate()
             .map(|(c, poly)| {
-                if keep.contains(&c) {
+                if keep_flags[c] {
                     poly.clone()
                 } else {
                     PolynomialValues::zero(1)
