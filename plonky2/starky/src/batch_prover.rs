@@ -851,9 +851,13 @@ where
         degree_bits,
     };
 
-    // Drop the large structures in parallel to avoid blocking on deallocation.
+    // Drop the large structures off the rayon pool: the frees are page-table
+    // work (madvise/munmap of hundreds of GiB), not CPU-parallel work, and a
+    // pool task steals workers from the wrapper stage that runs concurrently
+    // with this teardown. A detached OS thread frees the same memory without
+    // contending for the prover's worker threads.
     #[cfg(feature = "parallel")]
-    plonky2_maybe_rayon::rayon::spawn(move || {
+    std::thread::spawn(move || {
         drop(trace_oracles);
         drop(aux_oracles);
         drop(quotient_oracles);
