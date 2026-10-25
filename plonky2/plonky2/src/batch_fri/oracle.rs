@@ -24,9 +24,10 @@ use crate::iop::challenger::Challenger;
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::timed;
 use crate::util::fft_par::coset_fft_par;
-use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
 use crate::util::{reverse_bits, transpose_bitrev};
+use plonky2_field::extension::FieldExtension;
+use plonky2_field::packable::Packable;
 
 /// Hash commitment leaf rows into Merkle leaves (as field-element vectors).
 ///
@@ -343,7 +344,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         challenger: &mut Challenger<F, C::Hasher>,
         fri_params: &FriParams,
         timing: &mut TimingTree,
-    ) -> FriProof<F, C::Hasher, D> {
+    ) -> FriProof<F, C::Hasher, D>
+    where
+        F: Packable,
+        <F as Packable>::Packing: PackedField<Scalar = F>,
+    {
         assert_eq!(degree_bits.len(), instances.len());
         assert!(D > 1, "Not implemented for D=1.");
         assert!(
@@ -383,33 +388,88 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // There are usually two batches for the openings at `zeta` and `g * zeta`.
                 for (k, FriBatchInfo { point, polynomials }) in instance.batches.iter().enumerate()
                 {
-                    // All of the batch's runs reduce over full-degree base
-                    // polys, so the composition is a fixed-width weighted
-                    // sum: allocate once and accumulate each run's reduced
-                    // poly as a parallel axpy over coefficients (the serial
-                    // `+=` grow-loop rewalked the whole array per run).
                     let batch_runs: Vec<&crate::batch_fri::AlphaRun> = runs
                         .iter()
                         .filter(|r| r.instance == i && r.batch == k)
                         .collect();
-                    let mut composition_poly = PolynomialCoeffs::<F::Extension>::zero(degree);
-                    for run in batch_runs {
-                        let polys_coeff = polynomials[run.flat_start..run.flat_start + run.len]
+                    let run_specs: Vec<(F::Extension, Vec<&PolynomialCoeffs<F>>)> = batch_runs
+                        .iter()
+                        .map(|run| {
+                            let polys: Vec<&PolynomialCoeffs<F>> = polynomials
+                                [run.flat_start..run.flat_start + run.len]
+                                .iter()
+                                .map(|fri_poly| {
+                                    &oracles[fri_poly.oracle_index].polynomials
+                                        [fri_poly.polynomial_index]
+                                })
+                                .collect();
+                            (alpha.exp_u64(run.alpha_offset as u64), polys)
+                        })
+                        .collect();
+                    debug_assert!(
+                        run_specs
                             .iter()
-                            .map(|fri_poly| {
-                                &oracles[fri_poly.oracle_index].polynomials
-                                    [fri_poly.polynomial_index]
-                            })
-                            .collect::<Vec<_>>();
-                        let mut reduced =
-                            ReducingFactor::new(alpha).reduce_polys_base(&polys_coeff);
-                        reduced *= alpha.exp_u64(run.alpha_offset as u64);
-                        debug_assert_eq!(reduced.len(), degree);
+                            .flat_map(|(_, polys)| polys.iter())
+                            .all(|p| p.len() == degree),
+                        "fused composition indexes polys up to the instance degree"
+                    );
+                    // Tiled packed composition. The batch's runs all sweep the
+                    // same coefficient range, so tile over coefficients and
+                    // keep one accumulator tile per task: every poly's tile
+                    // slice is contiguous (prefetch-friendly) and the FE
+                    // weight broadcasts into a packed multiply-add. The
+                    // FE-weighted base axpy `acc += w * F::from(x)`
+                    // decomposes over the extension coordinates into
+                    // `acc_d += w_d * x` — packed base arithmetic, no
+                    // extension-typed ops in the hot loop. Tiling also
+                    // removes the small-instance pool starvation the
+                    // per-run sweeps suffered behind the tall instance.
+                    let mut composition_poly = PolynomialCoeffs::<F::Extension>::zero(degree);
+                    {
+                        const TILE: usize = 4096;
                         composition_poly
                             .coeffs
-                            .par_iter_mut()
-                            .zip(&reduced.coeffs)
-                            .for_each(|(c, &r)| *c += r);
+                            .par_chunks_mut(TILE)
+                            .enumerate()
+                            .for_each(|(t, dst_tile)| {
+                                let lo = t * TILE;
+                                let hi = lo + dst_tile.len();
+                                // Per-coordinate base accumulator tiles.
+                                let mut local: [Vec<F>; D] =
+                                    core::array::from_fn(|_| vec![F::ZERO; hi - lo]);
+                                for (run_alpha, polys) in run_specs.iter() {
+                                    let mut w = *run_alpha;
+                                    for p in polys.iter() {
+                                        let w_arr = w.to_basefield_array();
+                                        for (d, acc_d) in local.iter_mut().enumerate() {
+                                            let width = <F as Packable>::Packing::WIDTH;
+                                            let wd_vec: Vec<F> = (0..width).map(|_| w_arr[d]).collect();
+                                            let wd = *<<F as Packable>::Packing as PackedField>::from_slice(
+                                                &wd_vec,
+                                            );
+                                            let src = &p.coeffs[lo..hi];
+                                            let src_packed =
+                                                <<F as Packable>::Packing as PackedField>::pack_slice(src);
+                                            let mut acc_packed =
+                                                <<F as Packable>::Packing as PackedField>::pack_slice_mut(acc_d);
+                                            for (dst_chunk, src_chunk) in acc_packed
+                                                .iter_mut()
+                                                .zip(src_packed.iter())
+                                            {
+                                                *dst_chunk = *dst_chunk + *src_chunk * wd;
+                                            }
+                                        }
+                                        w *= alpha;
+                                    }
+                                }
+                                // Store the FE tile from the coordinate
+                                // accumulators.
+                                for (off, dst) in dst_tile.iter_mut().enumerate() {
+                                    let arr: [F; D] =
+                                        core::array::from_fn(|d| local[d][off]);
+                                    *dst = F::Extension::from_basefield_array(arr);
+                                }
+                            });
                     }
                     let quotient = divide_by_linear_par(&composition_poly.coeffs, *point);
                     debug_assert_eq!(quotient.len() + 1, degree);
