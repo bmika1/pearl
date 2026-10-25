@@ -273,11 +273,7 @@ impl<F: Field> CtlData<'_, F> {
     /// The helper *counts* (`zs_columns[i].helper_columns.len()`) are
     /// preserved for layout math downstream.
     pub(crate) fn take_ctl_polys(&mut self) -> Vec<PolynomialValues<F>> {
-        let num_helpers: usize = self
-            .zs_columns
-            .iter()
-            .map(|z| z.helper_columns.len())
-            .sum();
+        let num_helpers: usize = self.zs_columns.iter().map(|z| z.helper_columns.len()).sum();
         let num_zs = self.zs_columns.len();
         let mut res = Vec::with_capacity(num_helpers + num_zs);
         for z in &mut self.zs_columns {
@@ -497,7 +493,9 @@ pub(crate) fn cross_table_lookup_data<'a, F: RichField, const D: usize, const N:
         .collect::<Vec<_>>();
     let mut ctl_data_per_table = [0; N].map(|_| CtlData::default());
     for (work, mut helpers_zs) in works.into_iter().zip(results) {
-        let z = helpers_zs.pop().expect("partial sums always return a Z poly");
+        let z = helpers_zs
+            .pop()
+            .expect("partial sums always return a Z poly");
         ctl_data_per_table[work.table].zs_columns.push(CtlZData {
             helper_columns: helpers_zs,
             z,
@@ -544,11 +542,12 @@ fn partial_sums_with_evals<F: Field>(
     // independent Montgomery trick, and multiplies by the filter.
     // Functionally identical to the serial version: the Montgomery trick is
     // exact for any chunking, and the chunks are independent row ranges.
-    let combine_inverse_filter_into =
-        |instance: &[Vec<F>], filter: &[F], out: &mut [F]| {
-            let num_chunks = if out.len() >= (1 << 15) { 16 } else { 1 };
-            let chunk_len = out.len().div_ceil(num_chunks);
-            out.par_chunks_mut(chunk_len).enumerate().for_each(|(ci, combined)| {
+    let combine_inverse_filter_into = |instance: &[Vec<F>], filter: &[F], out: &mut [F]| {
+        let num_chunks = if out.len() >= (1 << 15) { 16 } else { 1 };
+        let chunk_len = out.len().div_ceil(num_chunks);
+        out.par_chunks_mut(chunk_len)
+            .enumerate()
+            .for_each(|(ci, combined)| {
                 let lo = ci * chunk_len;
                 if instance.len() == 1 {
                     for (o, &x) in combined.iter_mut().zip(&instance[0][lo..]) {
@@ -556,8 +555,7 @@ fn partial_sums_with_evals<F: Field>(
                     }
                 } else {
                     for (d, o) in combined.iter_mut().enumerate() {
-                        *o = challenge
-                            .combine_base(instance.iter().map(|vals| vals[lo + d]));
+                        *o = challenge.combine_base(instance.iter().map(|vals| vals[lo + d]));
                     }
                 }
                 let inverse = F::batch_multiplicative_inverse(combined);
@@ -566,7 +564,7 @@ fn partial_sums_with_evals<F: Field>(
                     *o *= f;
                 }
             });
-        };
+    };
 
     let chunks = (0..columns.len()).step_by(group);
     let mut helper_columns: Vec<PolynomialValues<F>> = Vec::new();

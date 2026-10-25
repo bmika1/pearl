@@ -769,11 +769,15 @@ where
         )
     };
 
-    // Compute all per-table openings.
+    // Compute all per-table openings. The tables' evaluations touch disjoint
+    // polynomial ranges of the shared immutable oracles, so the table loop
+    // itself parallelizes; a big table's per-polynomial Horner loops then
+    // subdivide across the same pool.
     let openings: Vec<StarkOpeningSet<F, D>> = timed!(
         timing,
         "compute openings",
         (0..N)
+            .into_par_iter()
             .map(|t| {
                 compute_table_openings(
                     &layout,

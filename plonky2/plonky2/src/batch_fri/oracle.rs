@@ -171,28 +171,31 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .iter()
             .map(|r| log2_strict(polynomials[r.start].len()))
             .collect();
+        // The height groups are mutually independent, and the tall ones carry
+        // only a handful of polynomials — running the groups one at a time
+        // leaves most cores idle while the tallest group's few serial FFTs
+        // dominate the phase. Run all groups' LDE + transpose concurrently;
+        // `lde_values` keeps parallelizing over the polys within a group
+        // (nested rayon iterators cooperate through work stealing).
+        // Inner `timed!` scopes are dropped: `TimingTree` is not `Sync`, and
+        // the enclosing phase scope already reports the total.
         let row_values: Vec<_> = ranges
-            .iter()
+            .par_iter()
             .map(|range| {
-                let lde = timed!(
-                    timing,
-                    "FFT",
-                    PolynomialBatch::<F, C, D>::lde_values(
-                        &polynomials[range.clone()],
-                        rate_bits,
-                        false,
-                        None,
-                    )
+                let lde = PolynomialBatch::<F, C, D>::lde_values(
+                    &polynomials[range.clone()],
+                    rate_bits,
+                    false,
+                    None,
                 );
-                let rows = timed!(timing, "transpose LDEs", transpose_bitrev(&lde));
-                rows
+                transpose_bitrev(&lde)
             })
             .collect();
         let leaves = timed!(
             timing,
             "hash digest leaves",
             row_values
-                .iter()
+                .par_iter()
                 .map(|rows| hash_leaf_rows::<F, C, D>(rows))
                 .collect()
         );
@@ -262,48 +265,47 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // untimed here (the tree is not Sync); the enclosing
         // "compute batched openings proof" scope still reports the total.
         type FinalLde<FE> = (PolynomialCoeffs<FE>, PolynomialValues<FE>);
-        let final_lde: Vec<FinalLde<F::Extension>> =
-            instances
-                .into_par_iter()
-                .enumerate()
-                .map(|(i, instance)| {
-                    // Final low-degree polynomial that goes into FRI.
-                    let mut final_poly = PolynomialCoeffs::empty();
+        let final_lde: Vec<FinalLde<F::Extension>> = instances
+            .into_par_iter()
+            .enumerate()
+            .map(|(i, instance)| {
+                // Final low-degree polynomial that goes into FRI.
+                let mut final_poly = PolynomialCoeffs::empty();
 
-                    // Each batch consists of an opening point `z` and polynomials `{f_j}_j` to be
-                    // opened at that point. Per [`AlphaRun`], the instance's polynomial is
-                    //   `E_i = Σ_batches (B(X) - B(z)) / (X - z)`,
-                    //   `B(X) = Σ_runs alpha^offset(run) · Σ_j alpha^j · f_run,j(X)`,
-                    // giving every opened claim a distinct, canonical power of `alpha`.
-                    // There are usually two batches for the openings at `zeta` and `g * zeta`.
-                    for (k, FriBatchInfo { point, polynomials }) in instance.batches.iter().enumerate() {
-                        let mut composition_poly = PolynomialCoeffs::empty();
-                        for run in runs.iter().filter(|r| r.instance == i && r.batch == k) {
-                            // Collect the coefficients of the run's polynomials.
-                            let polys_coeff = polynomials[run.flat_start..run.flat_start + run.len]
-                                .iter()
-                                .map(|fri_poly| {
-                                    &oracles[fri_poly.oracle_index]
-                                        .polynomials[fri_poly.polynomial_index]
-                                })
-                                .collect::<Vec<_>>();
-                            let mut reduced =
-                                ReducingFactor::new(alpha).reduce_polys_base(&polys_coeff);
-                            reduced *= alpha.exp_u64(run.alpha_offset as u64);
-                            composition_poly += reduced;
-                        }
-                        let mut quotient = composition_poly.divide_by_linear(*point);
-                        quotient.coeffs.push(F::Extension::ZERO); // pad back to power of two
-                        final_poly += quotient;
+                // Each batch consists of an opening point `z` and polynomials `{f_j}_j` to be
+                // opened at that point. Per [`AlphaRun`], the instance's polynomial is
+                //   `E_i = Σ_batches (B(X) - B(z)) / (X - z)`,
+                //   `B(X) = Σ_runs alpha^offset(run) · Σ_j alpha^j · f_run,j(X)`,
+                // giving every opened claim a distinct, canonical power of `alpha`.
+                // There are usually two batches for the openings at `zeta` and `g * zeta`.
+                for (k, FriBatchInfo { point, polynomials }) in instance.batches.iter().enumerate()
+                {
+                    let mut composition_poly = PolynomialCoeffs::empty();
+                    for run in runs.iter().filter(|r| r.instance == i && r.batch == k) {
+                        // Collect the coefficients of the run's polynomials.
+                        let polys_coeff = polynomials[run.flat_start..run.flat_start + run.len]
+                            .iter()
+                            .map(|fri_poly| {
+                                &oracles[fri_poly.oracle_index].polynomials
+                                    [fri_poly.polynomial_index]
+                            })
+                            .collect::<Vec<_>>();
+                        let mut reduced =
+                            ReducingFactor::new(alpha).reduce_polys_base(&polys_coeff);
+                        reduced *= alpha.exp_u64(run.alpha_offset as u64);
+                        composition_poly += reduced;
                     }
+                    let mut quotient = composition_poly.divide_by_linear(*point);
+                    quotient.coeffs.push(F::Extension::ZERO); // pad back to power of two
+                    final_poly += quotient;
+                }
 
-                    assert_eq!(final_poly.len(), 1 << degree_bits[i]);
-                    let lde_final_poly = final_poly.lde(fri_params.config.rate_bits);
-                    let lde_final_values =
-                        lde_final_poly.coset_fft(F::coset_shift().into());
-                    (lde_final_poly, lde_final_values)
-                })
-                .collect();
+                assert_eq!(final_poly.len(), 1 << degree_bits[i]);
+                let lde_final_poly = final_poly.lde(fri_params.config.rate_bits);
+                let lde_final_values = lde_final_poly.coset_fft(F::coset_shift().into());
+                (lde_final_poly, lde_final_values)
+            })
+            .collect();
 
         let mut final_lde_polynomial_coeff = Vec::with_capacity(final_lde.len());
         let mut final_lde_polynomial_values = Vec::with_capacity(final_lde.len());

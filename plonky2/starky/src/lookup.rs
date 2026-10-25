@@ -569,15 +569,7 @@ impl<F: Field> Column<F> {
 
     /// Read-only access to the compiled terms (consumed by the LUT counting
     /// fast path, which compiles a walk plan once per inventory).
-    pub fn parts(
-        &self,
-    ) -> (
-        &[(usize, F)],
-        &[(usize, F)],
-        &[(usize, usize)],
-        &[usize],
-        F,
-    ) {
+    pub fn parts(&self) -> (&[(usize, F)], &[(usize, F)], &[(usize, usize)], &[usize], F) {
         (
             &self.linear_combination,
             &self.next_row_linear_combination,
