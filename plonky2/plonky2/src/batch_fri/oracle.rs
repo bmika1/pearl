@@ -320,7 +320,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 .map(|o| &o.batch_merkle_tree)
                 .collect::<Vec<_>>(),
             &|oracle, index| oracles[oracle].open_values(index),
-            final_lde_polynomial_coeff[0].clone(),
+            &final_lde_polynomial_coeff,
             &final_lde_polynomial_values,
             challenger,
             fri_params,
