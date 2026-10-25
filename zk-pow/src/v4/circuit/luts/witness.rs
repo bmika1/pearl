@@ -222,11 +222,12 @@ impl<F: PrimeField64> LutChecker<F> {
         if num_rows == 0 {
             return Ok(());
         }
-        // Chunk boundaries: fixed-size chunks of >= 2^16 rows, capped at 256
-        // chunks — enough to fill any pool while keeping per-chunk counter
+        // Chunk boundaries: fixed-size chunks of >= 2^15 rows, capped at 512
+        // chunks — enough to over-subscribe any pool (with the walk tasks of
+        // all five tables sharing it) while keeping per-chunk counter
         // allocation amortized. The big tables (2^21..2^22 rows) dominate;
         // smaller ones fall back to one chunk.
-        let chunk_rows = (num_rows / 256).max(1 << 16).min(num_rows);
+        let chunk_rows = (num_rows / 512).max(1 << 15).min(num_rows);
         let num_chunks = num_rows.div_ceil(chunk_rows);
         debug_assert!(chunk_rows * num_chunks >= num_rows);
 
@@ -322,24 +323,34 @@ impl<F: PrimeField64> LutChecker<F> {
         if let Some(e) = first_err {
             return Err(e);
         }
-        // Chunks merge sequentially (different chunks touch the same
-        // destination slots), but each chunk's slot vectors merge in
-        // parallel — the folded tables' many-slot count vectors are where
-        // the serial merge cost lived.
-        for res in chunk_results {
-            let counts = res.expect("errors surfaced above");
-            for (table_position, src) in counts.counts.into_iter().enumerate() {
-                let table = counts.tables[table_position];
-                let dst_position = self.multiplicities.table_position(table);
-                self.multiplicities.counts[dst_position]
-                    .par_iter_mut()
-                    .zip(src)
-                    .for_each(|(dst_slot, src_slot)| {
-                        for (dst_row, src_row) in dst_slot.iter_mut().zip(src_slot) {
+        // Reduction merge: sum all chunks' counters slot-vector-wise. Every
+        // (table, slot) pair is disjoint across chunks, so the sum over
+        // chunks parallelizes over slot rows — one task per (table, slot)
+        // vector, each folding its chunks in row order.
+        let merged: Vec<_> = chunk_results
+            .into_iter()
+            .map(|res| res.expect("errors surfaced above"))
+            .collect();
+        for &table in inventory_tables.iter() {
+            let dst_position = self.multiplicities.table_position(table);
+            // Gather this table's per-chunk slot vectors once.
+            let per_chunk: Vec<&Vec<Vec<u64>>> = merged
+                .iter()
+                .map(|counts| {
+                    let src_pos = counts.table_position(table);
+                    &counts.counts[src_pos]
+                })
+                .collect();
+            self.multiplicities.counts[dst_position]
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(slot, dst_slot)| {
+                    for src in &per_chunk {
+                        for (dst_row, src_row) in dst_slot.iter_mut().zip(&src[slot]) {
                             *dst_row += src_row;
                         }
-                    });
-            }
+                    }
+                });
         }
         Ok(())
     }
