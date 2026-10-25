@@ -192,29 +192,36 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .collect_vec();
         assert!(degree_bits.windows(2).all(|pair| { pair[0] >= pair[1] }));
 
+        // Partition into maximal same-degree groups (in order).
         let num_polynomials = polynomials.len();
-        let mut group_start = 0;
-        let mut leaves = Vec::new();
-
-        for (i, d) in degree_bits.iter().enumerate() {
-            if i == num_polynomials - 1 || *d > degree_bits[i + 1] {
-                let lde_values = timed!(
-                    timing,
-                    "FFT + blinding",
-                    PolynomialBatch::<F, C, D>::lde_values(
-                        &polynomials[group_start..i + 1],
-                        rate_bits,
-                        blinding,
-                        fft_root_table[i]
-                    )
-                );
-
-                let leaf_group = timed!(timing, "transpose LDEs", transpose_bitrev(&lde_values));
-                leaves.push(leaf_group);
-
-                group_start = i + 1;
+        let mut groups: Vec<Range<usize>> = Vec::new();
+        {
+            let mut group_start = 0;
+            for (i, d) in degree_bits.iter().enumerate() {
+                if i == num_polynomials - 1 || *d > degree_bits[i + 1] {
+                    groups.push(group_start..i + 1);
+                    group_start = i + 1;
+                }
             }
         }
+
+        // The degree groups are independent: run their LDE + transpose
+        // concurrently (nested parallel iterators cooperate through work
+        // stealing), instead of one group at a time with the pool idling
+        // whenever a group holds few polynomials. `leaves` keeps the
+        // original tall-first group order.
+        let leaves: Vec<Vec<Vec<F>>> = groups
+            .par_iter()
+            .map(|range| {
+                let lde_values = PolynomialBatch::<F, C, D>::lde_values(
+                    &polynomials[range.clone()],
+                    rate_bits,
+                    blinding,
+                    fft_root_table[range.start],
+                );
+                transpose_bitrev(&lde_values)
+            })
+            .collect();
 
         let batch_merkle_tree = timed!(
             timing,
@@ -265,12 +272,14 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // The height groups are mutually independent, and the tall ones carry
         // only a handful of polynomials — running the groups one at a time
         // leaves most cores idle while the tallest group's few serial FFTs
-        // dominate the phase. Run all groups' LDE + transpose concurrently;
-        // `lde_values` keeps parallelizing over the polys within a group
-        // (nested rayon iterators cooperate through work stealing).
-        // Inner `timed!` scopes are dropped: `TimingTree` is not `Sync`, and
-        // the enclosing phase scope already reports the total.
-        let row_values: Vec<_> = ranges
+        // dominate the phase. Fusing each group's LDE + transpose + leaf-hash
+        // into one job lets the pool interleave them: while one worker
+        // hashes group A's rows (memory-bound, wide), another streams group
+        // B's LDE (compute-bound); the hash — the phase's long pole — runs
+        // concurrently with the other groups' setup instead of strictly
+        // after it. `row_values` keeps the raw rows for openings and the
+        // digest matrices go to the tree; both in `ranges` order.
+        let (row_values, digest_leaves): (Vec<_>, Vec<_>) = ranges
             .par_iter()
             .map(|range| {
                 let lde = PolynomialBatch::<F, C, D>::lde_values(
@@ -279,21 +288,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     false,
                     None,
                 );
-                transpose_bitrev(&lde)
+                let rows = transpose_bitrev(&lde);
+                let digests = hash_leaf_rows::<F, C, D>(&rows);
+                (rows, digests)
             })
-            .collect();
-        let leaves = timed!(
-            timing,
-            "hash digest leaves",
-            row_values
-                .par_iter()
-                .map(|rows| hash_leaf_rows::<F, C, D>(rows))
-                .collect()
-        );
+            .collect::<Vec<_>>()
+            .into_iter()
+            .unzip();
         let batch_merkle_tree = timed!(
             timing,
             "build digest Merkle tree",
-            BatchMerkleTree::new(leaves, cap_height)
+            BatchMerkleTree::new(digest_leaves, cap_height)
         );
         Self {
             polynomials,
