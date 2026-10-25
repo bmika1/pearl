@@ -23,6 +23,7 @@ use crate::hash::hash_types::RichField;
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::timed;
+use crate::util::fft_par::coset_fft_par;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
 use crate::util::{reverse_bits, transpose_bitrev};
@@ -256,6 +257,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         );
         let alpha = challenger.get_extension_challenge::<D>();
         let runs = batch_alpha_runs(instances);
+        timing.push("final-poly LDE", log::Level::Info);
 
         // The final low-degree polynomial of each FRI instance is built from
         // that instance's own batches (opening points and run reductions over
@@ -302,7 +304,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 
                 assert_eq!(final_poly.len(), 1 << degree_bits[i]);
                 let lde_final_poly = final_poly.lde(fri_params.config.rate_bits);
-                let lde_final_values = lde_final_poly.coset_fft(F::coset_shift().into());
+                let lde_final_values = coset_fft_par(&lde_final_poly, F::coset_shift().into());
                 (lde_final_poly, lde_final_values)
             })
             .collect();
@@ -313,6 +315,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             final_lde_polynomial_coeff.push(coeffs);
             final_lde_polynomial_values.push(values);
         }
+        timing.pop();
 
         batch_fri_proof_with_openings::<F, C, D>(
             &oracles

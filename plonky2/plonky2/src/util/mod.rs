@@ -13,6 +13,7 @@ use crate::hash::hash_types::RichField;
 
 pub(crate) mod context_tree;
 pub(crate) mod partial_products;
+pub mod fft_par;
 pub mod reducing;
 pub mod serialization;
 pub mod strided_view;

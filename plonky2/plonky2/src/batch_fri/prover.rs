@@ -19,6 +19,7 @@ use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
+use crate::util::fft_par::coset_fft_par;
 use crate::util::timing::TimingTree;
 
 /// Builds a batch FRI proof, opening each initial oracle's leaf values directly from its
@@ -105,6 +106,7 @@ pub fn batch_fri_proof_with_openings<
     );
 
     // Query phase
+    timing.push("query rounds", log::Level::Info);
     let query_round_proofs = batch_fri_prover_query_rounds::<F, C, D>(
         initial_merkle_trees,
         open_initial,
@@ -113,6 +115,7 @@ pub fn batch_fri_proof_with_openings<
         n,
         fri_params,
     );
+    timing.pop();
 
     FriProof {
         commit_phase_merkle_caps: trees.iter().map(|t| t.cap.clone()).collect(),
@@ -162,7 +165,7 @@ pub(crate) fn batch_fri_committed_trees<
                 .collect::<Vec<_>>(),
         );
         shift = shift.exp_u64(arity as u64);
-        final_values = final_coeffs.coset_fft(shift.into());
+        final_values = coset_fft_par(&final_coeffs, shift.into());
         if polynomial_index != values.len() && final_values.len() == values[polynomial_index].len()
         {
             // Inject instance `polynomial_index` into the folded codeword. The
