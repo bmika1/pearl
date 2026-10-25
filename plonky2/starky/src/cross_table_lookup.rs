@@ -38,7 +38,6 @@ use core::fmt::Debug;
 use anyhow::{ensure, Result};
 use hashbrown::HashMap;
 use itertools::Itertools;
-use plonky2::field::batch_util::batch_add_inplace;
 use plonky2::field::extension::{Extendable, FieldExtension};
 use plonky2::field::packed::PackedField;
 use plonky2::field::polynomial::PolynomialValues;
@@ -63,6 +62,12 @@ use crate::stark::Stark;
 
 /// An alias for `usize`, to represent the index of a STARK table in a multi-STARK setting.
 pub type TableIdx = usize;
+
+/// Row-chunk granularity for the per-chunk helper accumulation.
+const CTL_ACC_CHUNK: usize = 1 << 15;
+
+/// Number of blocks in the parallel Z suffix scan.
+const CTL_SCAN_BLOCKS: usize = 96;
 
 /// A `table` index with a linear combination of columns and a filter.
 /// `filter` is used to determine the rows to select in `table`.
@@ -567,34 +572,43 @@ fn partial_sums_with_evals<F: Field>(
     };
 
     let chunks = (0..columns.len()).step_by(group);
-    let mut helper_columns: Vec<PolynomialValues<F>> = Vec::new();
-    // Reused across instances of every chunk: one buffer of `degree` values,
-    // written by the row-parallel combine+inverse+filter helper.
-    let mut combined: Vec<F> = vec![F::ZERO; degree];
-    for chunk_start in chunks {
-        let mut acc: Option<Vec<F>> = None;
-        for (instance, filter) in columns[chunk_start..(chunk_start + group).min(columns.len())]
-            .iter()
-            .zip(&filters[chunk_start..(chunk_start + group).min(filters.len())])
-        {
-            combine_inverse_filter_into(instance, filter, &mut combined);
-            acc = Some(match acc {
-                None => combined.clone(),
-                Some(mut a) => {
-                    batch_add_inplace(&mut a, &combined);
-                    a
-                }
-            });
-        }
-        if let Some(h) = acc {
-            helper_columns.push(h.into());
-        }
-    }
+    // Helper columns: one per chunk of `group` instances. Chunks are
+    // independent — each accumulates its instances into its own pair of
+    // row buffers — so they run in parallel; within a chunk the instances
+    // stay serial (they share the combine buffer), but every buffer pass
+    // (combine+inverse+filter, and the accumulate into the helper column)
+    // is row-parallel.
+    let chunk_starts: Vec<usize> = chunks.collect();
+    let mut helper_columns: Vec<PolynomialValues<F>> = chunk_starts
+        .into_par_iter()
+        .map(|chunk_start| {
+            let instances = &columns[chunk_start..(chunk_start + group).min(columns.len())];
+            let chunk_filters = &filters[chunk_start..(chunk_start + group).min(filters.len())];
+            let mut combined = vec![F::ZERO; degree];
+            let mut acc = vec![F::ZERO; degree];
+            for (k, (instance, filter)) in instances.iter().zip(chunk_filters).enumerate() {
+                combine_inverse_filter_into(instance, filter, &mut combined);
+                acc.par_chunks_mut(CTL_ACC_CHUNK)
+                    .zip(combined.par_chunks(CTL_ACC_CHUNK))
+                    .for_each(|(a, c)| {
+                        if k == 0 {
+                            a.copy_from_slice(c);
+                        } else {
+                            for (a, c) in a.iter_mut().zip(c) {
+                                *a += *c;
+                            }
+                        }
+                    });
+            }
+            acc.into()
+        })
+        .collect();
 
     // Z suffix sums: `z[degree-1] = sum of the last helper values`, then each
-    // earlier `z[i] = z[i+1] + sum_h h[i]`. The per-row helper sums parallelize
-    // over row chunks; the suffix scan itself stays serial (a prefix-sum
-    // dependency chain too short to matter at these sizes).
+    // earlier `z[i] = z[i+1] + sum_h h[i]` — i.e. `z[i] = sum_{j>=i}` of the
+    // per-row helper sums. The per-row sums parallelize over rows; the suffix
+    // scan itself uses a blocked two-level scheme: parallel block sums, a
+    // short serial scan over the block totals, then parallel in-block scans.
     let num_helpers = helper_columns.len();
     let per_row_sums: Vec<F> = if num_helpers == 1 {
         helper_columns[0].values.clone()
@@ -605,13 +619,35 @@ fn partial_sums_with_evals<F: Field>(
             .map(|i| helper_columns.iter().map(|col| col.values[i]).sum::<F>())
             .collect()
     };
-    let mut z = Vec::with_capacity(degree);
-    let x = per_row_sums[degree - 1];
-    z.push(x);
-    for i in (0..degree - 1).rev() {
-        z.push(z[z.len() - 1] + per_row_sums[i]);
+    let mut z = vec![F::ZERO; degree];
+    let block_len = degree.div_ceil(CTL_SCAN_BLOCKS).max(1);
+    let num_blocks = degree.div_ceil(block_len);
+    // Parallel block totals…
+    let mut block_totals = vec![F::ZERO; num_blocks];
+    block_totals
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(b, total)| {
+            let lo = b * block_len;
+            let hi = ((b + 1) * block_len).min(degree);
+            *total = per_row_sums[lo..hi].iter().copied().sum();
+        });
+    // …a serial suffix scan over the (few) block totals: tails[b] holds the
+    // sum of every row after block b…
+    let mut tails = vec![F::ZERO; num_blocks + 1];
+    for b in (0..num_blocks).rev() {
+        tails[b] = tails[b + 1] + block_totals[b];
     }
-    z.reverse();
+    // …then the in-block suffix scans in parallel.
+    z.par_chunks_mut(block_len).enumerate().for_each(|(b, zb)| {
+        let lo = b * block_len;
+        let mut acc = tails[b + 1];
+        let sums = &per_row_sums[lo..lo + zb.len()];
+        for i in (0..zb.len()).rev() {
+            acc += sums[i];
+            zb[i] = acc;
+        }
+    });
 
     if columns.len() > 1 {
         helper_columns.push(z.into());

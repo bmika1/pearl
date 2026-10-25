@@ -25,10 +25,14 @@ use plonky2::plonk::plonk_common::{
     reduce_with_powers, reduce_with_powers_circuit, reduce_with_powers_ext_circuit,
 };
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
+use plonky2_maybe_rayon::*;
 
 use crate::constraint_consumer::{ConstraintConsumer, RecursiveConstraintConsumer};
 use crate::evaluation_frame::StarkEvaluationFrame;
 use crate::stark::Stark;
+
+/// Row-chunk granularity for parallel row-map passes in this module.
+const PAR_CHUNK: usize = 1 << 14;
 
 /// Represents a filter, which evaluates to 1 if the row must be considered and 0 if it should be ignored.
 /// It's an arbitrary degree 2 combination of columns: `products` are the degree 2 terms, and `constants` are
@@ -162,19 +166,27 @@ impl<F: Field> Filter<F> {
             let col1_vals = col1.eval_all_rows_with_inputs(table, public_inputs);
             let col2_vals = col2.eval_all_rows_with_inputs(table, public_inputs);
             result
-                .iter_mut()
-                .zip(col1_vals.iter())
-                .zip(col2_vals.iter())
-                .for_each(|((r, v1), v2)| *r += *v1 * *v2);
+                .par_chunks_mut(PAR_CHUNK)
+                .zip(col1_vals.par_chunks(PAR_CHUNK))
+                .zip(col2_vals.par_chunks(PAR_CHUNK))
+                .for_each(|((r, v1), v2)| {
+                    for ((r, v1), v2) in r.iter_mut().zip(v1).zip(v2) {
+                        *r += *v1 * *v2;
+                    }
+                });
         }
 
         // Accumulate linear terms
         for col in &self.constants {
             let col_vals = col.eval_all_rows_with_inputs(table, public_inputs);
             result
-                .iter_mut()
-                .zip(col_vals.iter())
-                .for_each(|(r, v)| *r += *v);
+                .par_chunks_mut(PAR_CHUNK)
+                .zip(col_vals.par_chunks(PAR_CHUNK))
+                .for_each(|(r, vals)| {
+                    for (r, v) in r.iter_mut().zip(vals) {
+                        *r += *v;
+                    }
+                });
         }
 
         result
@@ -606,17 +618,27 @@ impl<F: Field> Column<F> {
         for (col_idx, factor) in self.linear_combination.iter().copied().chain(scaled) {
             let col_values = &table[col_idx].values;
             result
-                .iter_mut()
-                .zip(col_values.iter())
-                .for_each(|(r, v)| *r += *v * factor);
+                .par_chunks_mut(PAR_CHUNK)
+                .zip(col_values.par_chunks(PAR_CHUNK))
+                .for_each(|(r, vals)| {
+                    for (r, v) in r.iter_mut().zip(vals) {
+                        *r += *v * factor;
+                    }
+                });
         }
 
         // Accumulate next-row linear combination terms
         for &(col_idx, factor) in &self.next_row_linear_combination {
             let col_values = &table[col_idx].values;
-            for (i, r) in result.iter_mut().enumerate() {
-                *r += col_values[(i + 1) % num_rows] * factor;
-            }
+            result
+                .par_chunks_mut(PAR_CHUNK)
+                .enumerate()
+                .for_each(|(ci, r)| {
+                    let lo = ci * PAR_CHUNK;
+                    for (i, r) in r.iter_mut().enumerate() {
+                        *r += col_values[(lo + i + 1) % num_rows] * factor;
+                    }
+                });
         }
 
         result
