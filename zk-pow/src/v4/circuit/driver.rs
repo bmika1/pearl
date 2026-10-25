@@ -727,11 +727,47 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         // ---- Native InputQuant advice: per-group side witnesses plus the compact
         // per-side outputs (noised fp8 codes, summand scores, per-matrix-row scale
         // tuples) the downstream tables consume — one fused parallel build, shared
-        // by `Arc` across the dead padding groups. ----
-        let as_int8 = |bytes: &[u8]| -> Vec<i8> { bytes.iter().map(|&b| b as i8).collect() };
-        let le_codes = |bytes: &[u8]| -> Vec<u16> { bytes.chunks(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect() };
-        let (a_int8, b_int8) = (as_int8(witness.a_values), as_int8(witness.b_values));
-        let (a_scale_codes, b_scale_codes) = (le_codes(witness.a_scales), le_codes(witness.b_scales));
+        // by `Arc` across the dead padding groups. The witness byte/code
+        // conversions stream hundreds of MiB and are pure maps: run all four
+        // concurrently on the pool instead of four serial passes. ----
+        let (a_int8, b_int8, a_scale_codes, b_scale_codes) = {
+            timing.push("trace: witness convert", log::Level::Debug);
+            let as_int8 = |bytes: &[u8]| -> Vec<i8> {
+                use plonky2_maybe_rayon::{IndexedParallelIterator, MaybeParChunks, MaybeParChunksMut, ParallelIterator};
+                let mut out = vec![0i8; bytes.len()];
+                out.par_chunks_mut(1 << 20)
+                    .zip(bytes.par_chunks(1 << 20))
+                    .for_each(|(o, i)| {
+                        for (o, &b) in o.iter_mut().zip(i) {
+                            *o = b as i8;
+                        }
+                    });
+                out
+            };
+            let le_codes = |bytes: &[u8]| -> Vec<u16> {
+                use plonky2_maybe_rayon::{IndexedParallelIterator, MaybeParChunks, MaybeParChunksMut, ParallelIterator};
+                let n = bytes.len() / 2;
+                let mut out = vec![0u16; n];
+                out.par_chunks_mut(1 << 20)
+                    .zip(bytes.par_chunks(1 << 21))
+                    .for_each(|(o, i)| {
+                        for (o, p) in o.iter_mut().zip(i.chunks(2)) {
+                            *o = u16::from_le_bytes([p[0], p[1]]);
+                        }
+                    });
+                out
+            };
+            let (a_int8, b_int8) = plonky2_maybe_rayon::join(
+                || as_int8(witness.a_values),
+                || as_int8(witness.b_values),
+            );
+            let (a_scale_codes, b_scale_codes) = plonky2_maybe_rayon::join(
+                || le_codes(witness.a_scales),
+                || le_codes(witness.b_scales),
+            );
+            timing.pop();
+            (a_int8, b_int8, a_scale_codes, b_scale_codes)
+        };
         let iq_native = timed!(
             timing,
             "trace: input_quant",
@@ -828,6 +864,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
 
         // ---- Column-major traces, canonical order. The IQ and Matmul traces' columns
         // were filled in place; wrap the calloc'd vectors without a transpose pass. ----
+        timing.push("trace: to-column-major", log::Level::Debug);
         let iq_trace: Vec<PolynomialValues<F>> = iq_cols.into_iter().map(PolynomialValues::new).collect();
         let mat_trace: Vec<PolynomialValues<F>> = mm_cols.into_iter().map(PolynomialValues::new).collect();
         let mut traces: Vec<Vec<PolynomialValues<F>>> = vec![
@@ -837,6 +874,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             mat_trace,
             column_major(&xf_rows),
         ];
+        timing.pop();
 
         // ---- Committed-LUT multiplicities: walk every AIR's inventory over its trace,
         // accumulating counts only — the serving validation is a debug/test-side
@@ -1004,26 +1042,50 @@ pub struct Fp8Witness<'a> {
 /// block's job, so the whole matrix streams from DRAM once (the naive per-column pass reads
 /// it once per column). Column buffers are written through their `MaybeUninit` spare
 /// capacity — each `(column, row)` slot is written exactly once before the length is set.
+///
+/// Parallel jobs are ROW tiles: each job streams its tile of source rows
+/// once, fully using every cache line (the column-blocked variant rereads
+/// the whole matrix once per 8-column block — for Blake3's 452 columns
+/// that is ~57 full re-streams). Column writes scatter to `N` buffers,
+/// one 8-byte element per (row, column), written exactly once via raw
+/// pointers into each column's spare capacity; disjoint across tiles.
 fn column_major<F: RichField, const N: usize>(rows: &[[F; N]]) -> Vec<PolynomialValues<F>> {
-    /// Columns per parallel job: 8 Goldilocks elements = one 64-byte line.
-    const COL_BLOCK: usize = 8;
+    /// Rows per job, tuned so the tile streams ~1 MiB of source rows
+    /// (L2-resident through the job's lifetime) and a deg-22 table
+    /// produces hundreds of jobs.
+    const ROW_TILE: usize = 4096;
 
     let num_rows = rows.len();
     let mut cols: Vec<Vec<F>> = (0..N).map(|_| Vec::with_capacity(num_rows)).collect();
     {
-        use plonky2_maybe_rayon::{IndexedParallelIterator, MaybeParChunksMut, ParallelIterator};
-        cols.par_chunks_mut(COL_BLOCK).enumerate().for_each(|(b, block)| {
-            let c0 = b * COL_BLOCK;
-            let mut bufs: Vec<_> = block.iter_mut().map(|col| col.spare_capacity_mut()).collect();
-            for (i, row) in rows.iter().enumerate() {
-                for (j, buf) in bufs.iter_mut().enumerate() {
-                    buf[i].write(row[c0 + j]);
+        // SAFETY wrapper: tiles write disjoint (row) regions of each
+        // column's spare capacity; `cols` outlives the parallel scope and
+        // is not read until after the join + set_len.
+        use plonky2_maybe_rayon::{MaybeIntoParIter as _, ParallelIterator as _};
+        struct ColPtr<F>(*mut F);
+        unsafe impl<F> Send for ColPtr<F> {}
+        unsafe impl<F> Sync for ColPtr<F> {}
+        let ptrs: Vec<ColPtr<F>> = cols.iter_mut().map(|c| ColPtr(c.as_mut_ptr())).collect();
+
+        (0..num_rows.div_ceil(ROW_TILE))
+            .into_par_iter()
+            .for_each(|tile| {
+                let r_lo = tile * ROW_TILE;
+                let r_hi = ((tile + 1) * ROW_TILE).min(num_rows);
+                for (i, row) in rows[r_lo..r_hi].iter().enumerate() {
+                    let i = r_lo + i;
+                    // SAFETY: the write targets column c's spare capacity
+                    // at offset i < num_rows; tiles own disjoint row ranges.
+                    unsafe {
+                        for (c, p) in ptrs.iter().enumerate() {
+                            *p.0.add(i) = row[c];
+                        }
+                    }
                 }
-            }
-            for col in block.iter_mut() {
-                unsafe { col.set_len(num_rows) };
-            }
-        });
+            });
+    }
+    for col in cols.iter_mut() {
+        unsafe { col.set_len(num_rows) };
     }
     cols.into_iter().map(PolynomialValues::new).collect()
 }
