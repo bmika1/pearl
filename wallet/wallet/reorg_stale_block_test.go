@@ -459,3 +459,49 @@ func TestDisconnectBlockNotChainSynced(t *testing.T) {
 	assert.Equal(t, forkHeight-1, w.Manager.SyncedTo().Height)
 	assert.Equal(t, branchHash(sharedBranch, forkHeight-1), w.Manager.SyncedTo().Hash)
 }
+
+// TestDisconnectBlockPrunedAncestors ensures disconnecting an orphaned branch
+// rewinds the manager to a block whose ancestors it has already pruned, and
+// leaves none of the branch's hashes above the new tip.
+func TestDisconnectBlockPrunedAncestors(t *testing.T) {
+	w, cleanup := testWallet(t)
+	defer cleanup()
+
+	orphan := mineCoinbase(t, w, orphanedBranch, forkHeight)
+	syncManagerTo(t, w, orphanedBranch, forkHeight-1, forkHeight+1)
+	setBirthdayBlock(t, w)
+	w.chainClient = &reorgChainClient{
+		mockChainClient: &mockChainClient{
+			getBestBlockHeight: tipHeight,
+			getBlockHeader:     &wire.BlockHeader{Timestamp: branchTime(forkHeight - 1)},
+		},
+		blockHashes: map[int64]chainhash.Hash{
+			int64(forkHeight): branchHash(canonicalBranch, forkHeight),
+		},
+	}
+
+	for height := forkHeight + 1; height >= forkHeight; height-- {
+		err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+			return w.disconnectBlock(tx, blockMeta(orphanedBranch, height))
+		})
+		require.NoError(t, err, "disconnect at height %d", height)
+	}
+
+	assert.False(t, hasStoredCredit(t, w, orphan))
+	assert.Equal(t, waddrmgr.BlockStamp{
+		Height:    forkHeight - 1,
+		Hash:      branchHash(sharedBranch, forkHeight-1),
+		Timestamp: branchTime(forkHeight - 1),
+	}, w.Manager.SyncedTo())
+
+	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
+		ns := tx.ReadBucket(waddrmgrNamespaceKey)
+		for height := forkHeight; height <= forkHeight+1; height++ {
+			_, err := w.Manager.BlockHash(ns, height)
+			assert.True(t, waddrmgr.IsError(err, waddrmgr.ErrBlockNotFound), "hash left at height %d", height)
+		}
+
+		return nil
+	})
+	require.NoError(t, err)
+}

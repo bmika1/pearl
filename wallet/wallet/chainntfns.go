@@ -310,7 +310,7 @@ func (w *Wallet) disconnectBlock(dbtx walletdb.ReadWriteTx,
 	if previous != nil {
 		// A delayed connection may leave the manager on the old block
 		// even when the store already holds its replacement.
-		err = w.Manager.SetSyncedTo(addrmgrNs, previous)
+		err = w.Manager.Rollback(addrmgrNs, previous)
 		if err != nil {
 			return err
 		}
