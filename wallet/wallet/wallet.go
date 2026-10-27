@@ -532,9 +532,14 @@ func (w *Wallet) rollbackToChain(chainClient chainConn) error {
 		return fmt.Errorf("unable to read the wallet's recorded blocks: %w", err)
 	}
 
+	_, bestHeight, err := chainClient.GetBestBlock()
+	if err != nil {
+		return fmt.Errorf("unable to fetch the chain's best block: %w", err)
+	}
+
 	// Verify those blocks with no database transaction held, as this
 	// queries the backend once per recorded block.
-	staleHeight, err := lowestStaleBlockHeight(chainClient, blocks)
+	staleHeight, err := lowestStaleBlockHeight(chainClient, blocks, bestHeight)
 	if err != nil {
 		return fmt.Errorf("unable to verify the wallet's %d recorded blocks against the chain: %w", len(blocks), err)
 	}
@@ -545,7 +550,7 @@ func (w *Wallet) rollbackToChain(chainClient chainConn) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
 
-		target, err := w.forkPoint(addrmgrNs, chainClient, syncedTo.Height)
+		target, err := w.forkPoint(addrmgrNs, chainClient, syncedTo.Height, bestHeight)
 		if err != nil {
 			return err
 		}
@@ -582,8 +587,17 @@ func (w *Wallet) rollbackToChain(chainClient chainConn) error {
 
 // forkPoint returns the highest block at or below the given height that both
 // the address manager and the chain have recorded.
-func (w *Wallet) forkPoint(ns walletdb.ReadBucket, chainClient chainConn, height int32) (waddrmgr.BlockStamp, error) {
+func (w *Wallet) forkPoint(ns walletdb.ReadBucket, chainClient chainConn,
+	height, bestHeight int32) (waddrmgr.BlockStamp, error) {
+
 	for {
+		// The backend fails lookups above its tip, so querying these heights
+		// would fail every sync of a wallet that is ahead of a shorter chain.
+		if height > bestHeight {
+			height--
+			continue
+		}
+
 		hash, err := w.Manager.BlockHash(ns, height)
 		if err != nil {
 			return waddrmgr.BlockStamp{}, err
@@ -624,12 +638,7 @@ func canonicalStampAt(chainClient chainConn, height int32) (waddrmgr.BlockStamp,
 // lowestStaleBlockHeight returns the height of the lowest given block that the
 // chain no longer has, or zero when the chain still has all of them. The
 // blocks must be ordered by ascending height.
-func lowestStaleBlockHeight(chainClient chainConn, blocks []wtxmgr.Block) (int32, error) {
-	_, bestHeight, err := chainClient.GetBestBlock()
-	if err != nil {
-		return 0, err
-	}
-
+func lowestStaleBlockHeight(chainClient chainConn, blocks []wtxmgr.Block, bestHeight int32) (int32, error) {
 	started := time.Now()
 	for _, b := range blocks {
 		// Genesis cannot be reorged out, and skipping it keeps the

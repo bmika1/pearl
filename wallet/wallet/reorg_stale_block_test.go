@@ -5,6 +5,7 @@
 package wallet
 
 import (
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -89,6 +90,9 @@ func (c *reorgChainConn) GetBestBlock() (*chainhash.Hash, int32, error) {
 
 func (c *reorgChainConn) GetBlockHash(height int64) (*chainhash.Hash, error) {
 	c.blockHashCalls++
+	if height > int64(c.tip) {
+		return nil, fmt.Errorf("block height %d is above the chain tip %d", height, c.tip)
+	}
 	hash := branchHash(c.branch, int32(height))
 
 	return &hash, nil
@@ -239,7 +243,10 @@ func lowestStaleHeight(t *testing.T, w *Wallet, conn chainConn) int32 {
 	})
 	require.NoError(t, err)
 
-	height, err := lowestStaleBlockHeight(conn, blocks)
+	_, bestHeight, err := conn.GetBestBlock()
+	require.NoError(t, err)
+
+	height, err := lowestStaleBlockHeight(conn, blocks, bestHeight)
 	require.NoError(t, err)
 
 	return height
@@ -427,6 +434,26 @@ func TestRollbackToChainStaleManager(t *testing.T) {
 
 	assert.False(t, hasStoredCredit(t, w, coinbase))
 	assert.Equal(t, forkHeight-1, w.Manager.SyncedTo().Height)
+}
+
+// TestRollbackToChainAboveTip ensures a wallet synced past the tip of a shorter
+// chain rewinds to the fork point instead of failing on the heights that chain
+// does not have.
+func TestRollbackToChainAboveTip(t *testing.T) {
+	w, cleanup := testWallet(t)
+	defer cleanup()
+
+	coinbase := mineCoinbase(t, w, orphanedBranch, forkHeight+10)
+	syncManagerTo(t, w, orphanedBranch, forkHeight-1, forkHeight+20)
+	setBirthdayBlock(t, w)
+
+	conn := &reorgChainConn{branch: canonicalBranch, tip: forkHeight + 5}
+	require.NoError(t, w.rollbackToChain(conn))
+
+	assert.False(t, hasStoredCredit(t, w, coinbase))
+	assert.Nil(t, txDetails(t, w, coinbase.Hash))
+	assert.Equal(t, forkHeight-1, w.Manager.SyncedTo().Height)
+	assert.Equal(t, branchHash(sharedBranch, forkHeight-1), w.Manager.SyncedTo().Hash)
 }
 
 // TestDisconnectBlockNotChainSynced ensures a disconnect that arrives before
