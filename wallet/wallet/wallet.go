@@ -85,6 +85,10 @@ var (
 	// watch-only mode where we can select coins but not sign any inputs.
 	ErrTxUnsigned = errors.New("watch-only wallet, transaction not signed")
 
+	// errChainBehindWallet is returned when the chain's tip is below the wallet's and nothing shows a reorg, so the
+	// sync waits for the chain to catch up instead of rolling back history the chain has not reached yet.
+	errChainBehindWallet = errors.New("chain is behind the wallet")
+
 	// Namespace bucket keys.
 	waddrmgrNamespaceKey = []byte("waddrmgr")
 	wtxmgrNamespaceKey   = []byte("wtxmgr")
@@ -513,9 +517,11 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 	return w.rescanWithTarget(addrs, unspent, nil)
 }
 
-// rollbackToChain compares the blocks the wallet has previously seen against
-// the current chain and rolls back the ones that are no longer part of it, so
-// that the rescan which follows re-applies the canonical chain.
+// rollbackToChain compares the blocks the wallet has previously seen against the current chain and rolls back the ones
+// that are no longer part of it, so that the rescan which follows re-applies the canonical chain. A chain whose tip is
+// below the wallet's only proves a reorg through a different block at a height it has. Without one, rollbackToChain
+// fails with errChainBehindWallet and leaves the wallet's history in place, so the sync retries until the chain catches
+// up.
 func (w *Wallet) rollbackToChain(chainClient chainConn) error {
 	// The address manager's hash history is overwritten with canonical
 	// hashes as blocks are connected, so a reorg the wallet never applied
@@ -544,12 +550,13 @@ func (w *Wallet) rollbackToChain(chainClient chainConn) error {
 	}
 
 	syncedTo := w.Manager.SyncedTo()
+	start := min(syncedTo.Height, bestHeight)
 
 	return walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
 
-		target, err := w.forkPoint(addrmgrNs, chainClient, syncedTo.Height, bestHeight)
+		target, err := w.forkPoint(addrmgrNs, chainClient, start)
 		if err != nil {
 			return err
 		}
@@ -565,7 +572,12 @@ func (w *Wallet) rollbackToChain(chainClient chainConn) error {
 		}
 
 		// Nothing diverged, so there is nothing to detach.
-		if target.Height == syncedTo.Height && staleHeight == 0 {
+		if target.Height == start && staleHeight == 0 {
+			if start < syncedTo.Height {
+				return fmt.Errorf("%w: the wallet is synced to height %d and the chain's tip is at height %d",
+					errChainBehindWallet, syncedTo.Height, bestHeight)
+			}
+
 			return nil
 		}
 
@@ -584,22 +596,14 @@ func (w *Wallet) rollbackToChain(chainClient chainConn) error {
 	})
 }
 
-// forkPoint returns the highest block at or below the given height that both
-// the address manager and the chain have recorded.
-func (w *Wallet) forkPoint(ns walletdb.ReadBucket, chainClient chainConn, height, bestHeight int32) (
-	waddrmgr.BlockStamp, error) {
-
+// forkPoint returns the highest block at or below the given height that both the address manager and the chain have
+// recorded. The height must not be above the chain's tip.
+func (w *Wallet) forkPoint(ns walletdb.ReadBucket, chainClient chainConn, height int32) (waddrmgr.BlockStamp, error) {
 	for {
-		// The backend fails lookups above its tip, so querying these heights would fail every sync of a wallet that is
-		// ahead of a shorter chain.
-		if height > bestHeight {
-			height--
-			continue
-		}
-
 		hash, err := w.Manager.BlockHash(ns, height)
 		if err != nil {
-			return waddrmgr.BlockStamp{}, err
+			return waddrmgr.BlockStamp{}, fmt.Errorf(
+				"unable to read the wallet's block hash at height %d to compare with the chain: %w", height, err)
 		}
 
 		stamp, err := canonicalStampAt(chainClient, height)
@@ -634,26 +638,30 @@ func canonicalStampAt(chainClient chainConn, height int32) (waddrmgr.BlockStamp,
 	}, nil
 }
 
-// lowestStaleBlockHeight returns the height of the lowest given block that the
-// chain no longer has, or zero when the chain still has all of them. The
-// blocks must be ordered by ascending height.
+// lowestStaleBlockHeight returns the height of the lowest given block that the chain has replaced with a different
+// block, or zero when there is none. Blocks above bestHeight count as unverified rather than stale, as a backend that
+// is still catching up may not have them yet. The blocks must be ordered by ascending height.
 func lowestStaleBlockHeight(chainClient chainConn, blocks []wtxmgr.Block, bestHeight int32) (int32, error) {
 	started := time.Now()
-	for _, b := range blocks {
+	verified := len(blocks)
+	for i, b := range blocks {
 		// Genesis cannot be reorged out, and skipping it keeps the
 		// parent of a stale block a real height.
 		if b.Height <= 0 {
 			continue
 		}
 
-		if b.Height <= bestHeight {
-			hash, err := chainClient.GetBlockHash(int64(b.Height))
-			if err != nil {
-				return 0, err
-			}
-			if *hash == b.Hash {
-				continue
-			}
+		if b.Height > bestHeight {
+			verified = i
+			break
+		}
+
+		hash, err := chainClient.GetBlockHash(int64(b.Height))
+		if err != nil {
+			return 0, err
+		}
+		if *hash == b.Hash {
+			continue
 		}
 
 		log.Warnf("Block %v at height %d is no longer on the chain, rolling back a reorg that was never applied",
@@ -662,7 +670,8 @@ func lowestStaleBlockHeight(chainClient chainConn, blocks []wtxmgr.Block, bestHe
 		return b.Height, nil
 	}
 
-	log.Infof("Verified the wallet's %d recorded blocks against the chain in %v", len(blocks), time.Since(started))
+	log.Infof("Verified %d of the wallet's %d recorded blocks against the chain in %v", verified, len(blocks),
+		time.Since(started))
 
 	return 0, nil
 }

@@ -294,14 +294,13 @@ func TestLowestStaleBlockHeight(t *testing.T) {
 		wantHeight: forkHeight,
 		wantCalls:  2,
 	}, {
-		name: "record above the chain tip",
+		name: "record above the chain tip is unverified",
 		records: []record{
 			{sharedBranch, forkHeight - 10},
 			{canonicalBranch, tipHeight + 5},
 		},
-		tip:        tipHeight,
-		wantHeight: tipHeight + 5,
-		wantCalls:  1,
+		tip:       tipHeight,
+		wantCalls: 1,
 	}, {
 		name: "stale record deeper than the manager keeps hashes",
 		records: []record{
@@ -453,6 +452,40 @@ func TestRollbackToChainAboveTip(t *testing.T) {
 	assert.Nil(t, txDetails(t, w, coinbase.Hash))
 	assert.Equal(t, forkHeight-1, w.Manager.SyncedTo().Height)
 	assert.Equal(t, branchHash(sharedBranch, forkHeight-1), w.Manager.SyncedTo().Hash)
+}
+
+// TestRollbackToChainLaggingBackend ensures a backend that is behind the wallet, but agrees with it at the heights it
+// has, fails the sync instead of rolling back blocks it has not reached yet.
+func TestRollbackToChainLaggingBackend(t *testing.T) {
+	w, cleanup := testWallet(t)
+	defer cleanup()
+
+	coinbase := mineCoinbase(t, w, canonicalBranch, forkHeight+10)
+	syncManagerTo(t, w, canonicalBranch, forkHeight-1, forkHeight+20)
+	setBirthdayBlock(t, w)
+
+	conn := &reorgChainConn{branch: canonicalBranch, tip: forkHeight + 5}
+	require.ErrorIs(t, w.rollbackToChain(conn), errChainBehindWallet)
+
+	assert.True(t, hasStoredCredit(t, w, coinbase))
+	assert.Equal(t, forkHeight+20, w.Manager.SyncedTo().Height)
+}
+
+// TestRollbackToChainUnverifiableAboveTip ensures a wallet whose block hashes no longer reach down to the chain's tip
+// keeps its history, as nothing then shows where the two diverge.
+func TestRollbackToChainUnverifiableAboveTip(t *testing.T) {
+	w, cleanup := testWallet(t)
+	defer cleanup()
+
+	coinbase := mineCoinbase(t, w, orphanedBranch, forkHeight+10)
+	syncManagerTo(t, w, orphanedBranch, forkHeight+20, forkHeight+20)
+	setBirthdayBlock(t, w)
+
+	conn := &reorgChainConn{branch: canonicalBranch, tip: forkHeight + 5}
+	require.Error(t, w.rollbackToChain(conn))
+
+	assert.True(t, hasStoredCredit(t, w, coinbase))
+	assert.Equal(t, forkHeight+20, w.Manager.SyncedTo().Height)
 }
 
 // TestDisconnectBlockNotChainSynced ensures a disconnect that arrives before the wallet is chain synced still rolls the
