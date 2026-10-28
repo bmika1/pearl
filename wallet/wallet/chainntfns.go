@@ -547,7 +547,8 @@ func retainedCoinbaseDescendants(details map[chainhash.Hash]wtxmgr.TxDetails,
 }
 
 // disconnectedBlockStamp returns the preceding sync stamp only when the address manager knows the exact disconnected
-// block. Transaction history may be ahead of, or on a different chain from, the manager during a rescan.
+// block and the chain no longer has it. Transaction history may be ahead of, or on a different chain from, the manager
+// during a rescan.
 //
 //nolint:nilnil // An unknown block does not require rewinding the manager.
 func (w *Wallet) disconnectedBlockStamp(ns walletdb.ReadBucket, block *wtxmgr.Block) (*waddrmgr.BlockStamp, error) {
@@ -568,6 +569,13 @@ func (w *Wallet) disconnectedBlockStamp(ns walletdb.ReadBucket, block *wtxmgr.Bl
 		return nil, nil
 	}
 
+	// A disconnect can arrive after the backend has switched back to the block, for example as a duplicate from the
+	// other notification producer. Rewinding would then delete hashes that the next connect needs.
+	onChain, err := chainHasBlock(w.ChainClient(), block)
+	if err != nil || onChain {
+		return nil, err
+	}
+
 	height := block.Height - 1
 
 	hash, err = w.Manager.BlockHash(ns, height)
@@ -585,6 +593,25 @@ func (w *Wallet) disconnectedBlockStamp(ns walletdb.ReadBucket, block *wtxmgr.Bl
 		Hash:      *hash,
 		Timestamp: header.Timestamp,
 	}, nil
+}
+
+// chainHasBlock reports whether the chain's block at the given block's height is that block.
+func chainHasBlock(client chainConn, block *wtxmgr.Block) (bool, error) {
+	_, bestHeight, err := client.GetBestBlock()
+	if err != nil {
+		return false, err
+	}
+
+	if block.Height > bestHeight {
+		return false, nil
+	}
+
+	hash, err := client.GetBlockHash(int64(block.Height))
+	if err != nil {
+		return false, err
+	}
+
+	return hash != nil && *hash == block.Hash, nil
 }
 
 func (w *Wallet) addRelevantTx(dbtx walletdb.ReadWriteTx, rec *wtxmgr.TxRecord, block *wtxmgr.BlockMeta) error {

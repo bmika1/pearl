@@ -500,7 +500,8 @@ func TestDisconnectBlockPrunedAncestors(t *testing.T) {
 			getBlockHeader:     &wire.BlockHeader{Timestamp: branchTime(forkHeight - 1)},
 		},
 		blockHashes: map[int64]chainhash.Hash{
-			int64(forkHeight): branchHash(canonicalBranch, forkHeight),
+			int64(forkHeight):     branchHash(canonicalBranch, forkHeight),
+			int64(forkHeight + 1): branchHash(canonicalBranch, forkHeight+1),
 		},
 	}
 
@@ -528,4 +529,35 @@ func TestDisconnectBlockPrunedAncestors(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
+}
+
+// TestDisconnectBlockStillOnChain ensures a disconnect of a block the backend still has leaves the manager in place, as
+// the next connect needs the hashes a rewind would discard.
+func TestDisconnectBlockStillOnChain(t *testing.T) {
+	w, cleanup := testWallet(t)
+	defer cleanup()
+
+	syncManagerTo(t, w, canonicalBranch, forkHeight-1, forkHeight+1)
+	setBirthdayBlock(t, w)
+	w.chainClient = &reorgChainClient{
+		mockChainClient: &mockChainClient{
+			getBestBlockHeight: tipHeight,
+			getBlockHeader:     &wire.BlockHeader{Timestamp: branchTime(forkHeight)},
+		},
+		blockHashes: map[int64]chainhash.Hash{
+			int64(forkHeight + 1): branchHash(canonicalBranch, forkHeight+1),
+		},
+	}
+
+	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		return w.disconnectBlock(tx, blockMeta(canonicalBranch, forkHeight+1))
+	})
+	require.NoError(t, err)
+	assert.Equal(t, forkHeight+1, w.Manager.SyncedTo().Height)
+
+	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		return w.connectBlock(tx, blockMeta(canonicalBranch, forkHeight+2))
+	})
+	require.NoError(t, err)
+	assert.Equal(t, forkHeight+2, w.Manager.SyncedTo().Height)
 }
