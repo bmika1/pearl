@@ -791,8 +791,8 @@ func TestBlocks(t *testing.T) {
 	assert.Equal(t, want, blocks)
 }
 
-// TestStoreBlockHash verifies that recorded block identities survive reopening
-// and that heights with no wallet transactions have no stored block identity.
+// TestStoreBlockHash verifies that recorded block identities survive reopening and that heights with no wallet
+// transactions have no stored block identity.
 func TestStoreBlockHash(t *testing.T) {
 	t.Parallel()
 

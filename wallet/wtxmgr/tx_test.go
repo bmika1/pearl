@@ -2347,9 +2347,7 @@ func blockIdentityRecord(t *testing.T, n byte) *TxRecord {
 	t.Helper()
 
 	msg := wire.NewMsgTx(2)
-	msg.AddTxIn(wire.NewTxIn(
-		&wire.OutPoint{Hash: chainhash.Hash{n}}, nil, nil,
-	))
+	msg.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{n}}, nil, nil))
 	msg.AddTxOut(wire.NewTxOut(1000, []byte{0x51}))
 
 	rec, err := NewTxRecordFromMsgTx(msg, time.Unix(1, 0))
@@ -2358,8 +2356,8 @@ func blockIdentityRecord(t *testing.T, n byte) *TxRecord {
 	return rec
 }
 
-// TestInsertTxBlockIdentity verifies that a conflicting block cannot corrupt
-// confirmed history or consume a previously unmined transaction and its credit.
+// TestInsertTxBlockIdentity verifies that a conflicting block cannot corrupt confirmed history or consume a previously
+// unmined transaction and its credit.
 func TestInsertTxBlockIdentity(t *testing.T) {
 	t.Parallel()
 
@@ -2386,9 +2384,7 @@ func TestInsertTxBlockIdentity(t *testing.T) {
 	require.NoError(t, err)
 
 	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
-		return s.InsertTx(
-			tx.ReadWriteBucket(namespaceKey), b, &replacement,
-		)
+		return s.InsertTx(tx.ReadWriteBucket(namespaceKey), b, &replacement)
 	})
 
 	var inputErr Error
@@ -2406,11 +2402,10 @@ func TestInsertTxBlockIdentity(t *testing.T) {
 
 		var count int
 
-		err = s.RangeTransactions(ns, 0, -1,
-			func(txs []TxDetails) (bool, error) {
-				count += len(txs)
-				return false, nil
-			})
+		err = s.RangeTransactions(ns, 0, -1, func(txs []TxDetails) (bool, error) {
+			count += len(txs)
+			return false, nil
+		})
 		require.NoError(t, err)
 		require.Equal(t, 2, count)
 
@@ -2419,11 +2414,10 @@ func TestInsertTxBlockIdentity(t *testing.T) {
 		require.NoError(t, s.InsertTx(ns, b, block))
 		assertBalance(t, s, ns, true, 100, 1000)
 
-		return s.RangeTransactions(ns, 100, 100,
-			func(txs []TxDetails) (bool, error) {
-				require.Len(t, txs, 2)
-				return false, nil
-			})
+		return s.RangeTransactions(ns, 100, 100, func(txs []TxDetails) (bool, error) {
+			require.Len(t, txs, 2)
+			return false, nil
+		})
 	})
 	require.NoError(t, err)
 }
@@ -2608,9 +2602,7 @@ func assertOutputLocksExist(t *testing.T, s *Store, ns walletdb.ReadBucket,
 	}
 }
 
-func assertRetainedLock(t *testing.T, s *Store, ns walletdb.ReadBucket,
-	releaseConfs uint32, spendHeight int32) {
-
+func assertRetainedLock(t *testing.T, s *Store, ns walletdb.ReadBucket, releaseConfs uint32, spendHeight int32) {
 	t.Helper()
 
 	locks, err := s.ListLockedOutputs(ns)
@@ -2624,13 +2616,11 @@ func assertRetainedLock(t *testing.T, s *Store, ns walletdb.ReadBucket,
 
 	lock := locks[0]
 	if lock.ReleaseAfterSpendConfs != releaseConfs {
-		t.Fatalf("expected maturity %d, got %d", releaseConfs,
-			lock.ReleaseAfterSpendConfs)
+		t.Fatalf("expected maturity %d, got %d", releaseConfs, lock.ReleaseAfterSpendConfs)
 	}
 
 	if lock.ConfirmedSpendHeight != spendHeight {
-		t.Fatalf("expected spend height %d, got %d", spendHeight,
-			lock.ConfirmedSpendHeight)
+		t.Fatalf("expected spend height %d, got %d", spendHeight, lock.ConfirmedSpendHeight)
 	}
 }
 
@@ -2839,8 +2829,8 @@ func TestOutputLocks(t *testing.T) {
 			},
 		},
 		{
-			// Asserts that a confirmation-controlled lease ignores its
-			// wall-clock expiry but still permits explicit owner release.
+			// Asserts that a confirmation-controlled lease ignores its wall-clock expiry but still permits explicit
+			// owner release.
 			name: "confirmation lease ignores wall clock",
 			run: func(t *testing.T, s *Store, ns walletdb.ReadWriteBucket) {
 				t.Helper()
@@ -2848,10 +2838,7 @@ func TestOutputLocks(t *testing.T) {
 				lockID1 := LockID{1}
 				lockID2 := LockID{2}
 
-				expiry, err := s.LockOutput(
-					ns, lockID1, confirmedOutPoint, 10*time.Minute,
-					WithReleaseAfterSpend(3),
-				)
+				expiry, err := s.LockOutput(ns, lockID1, confirmedOutPoint, 10*time.Minute, WithReleaseAfterSpend(3))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -2864,9 +2851,7 @@ func TestOutputLocks(t *testing.T) {
 				}
 
 				testClock.SetTime(expiry)
-				assertLocked(
-					t, ns, confirmedOutPoint, s.clock.Now(), true,
-				)
+				assertLocked(t, ns, confirmedOutPoint, s.clock.Now(), true)
 
 				err = s.DeleteExpiredLockedOutputs(ns)
 				if err != nil {
@@ -2874,23 +2859,15 @@ func TestOutputLocks(t *testing.T) {
 				}
 				assertRetainedLock(t, s, ns, 3, 0)
 
-				_, err = s.LockOutput(
-					ns, lockID2, confirmedOutPoint, 10*time.Minute,
-				)
+				_, err = s.LockOutput(ns, lockID2, confirmedOutPoint, 10*time.Minute)
 				if err != ErrOutputAlreadyLocked {
-					t.Fatalf("expected %v, got %v",
-						ErrOutputAlreadyLocked, err)
+					t.Fatalf("expected %v, got %v", ErrOutputAlreadyLocked, err)
 				}
 
-				unlock(
-					t, s, ns, lockID2, confirmedOutPoint,
-					ErrOutputUnlockNotAllowed,
-				)
+				unlock(t, s, ns, lockID2, confirmedOutPoint, ErrOutputUnlockNotAllowed)
 				unlock(t, s, ns, lockID1, confirmedOutPoint, nil)
 
-				_, err = s.LockOutput(
-					ns, lockID1, confirmedOutPoint, 10*time.Minute,
-				)
+				_, err = s.LockOutput(ns, lockID1, confirmedOutPoint, 10*time.Minute)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -3078,8 +3055,8 @@ func TestOutputLocks(t *testing.T) {
 	}
 }
 
-// TestDeserializeLegacyLockedOutput verifies that lock rows written before
-// release-after-spend support remain readable with the legacy lease behavior.
+// TestDeserializeLegacyLockedOutput verifies that lock rows written before release-after-spend support remain readable
+// with the legacy lease behavior.
 func TestDeserializeLegacyLockedOutput(t *testing.T) {
 	t.Parallel()
 
@@ -3089,8 +3066,7 @@ func TestDeserializeLegacyLockedOutput(t *testing.T) {
 	copy(legacyValue, lockID[:])
 	byteOrder.PutUint64(legacyValue[len(lockID):], uint64(expiry.Unix()))
 
-	gotID, gotExpiry, releaseConfs, spendHeight :=
-		deserializeLockedOutput(legacyValue)
+	gotID, gotExpiry, releaseConfs, spendHeight := deserializeLockedOutput(legacyValue)
 	if gotID != lockID {
 		t.Fatalf("expected lock ID %x, got %x", lockID, gotID)
 	}
@@ -3105,9 +3081,8 @@ func TestDeserializeLegacyLockedOutput(t *testing.T) {
 	}
 }
 
-// TestOutputLockReleaseAfterSpendAcrossReorg verifies that a lock follows the
-// confirmed spend, resets on rollback, and releases only after the
-// re-confirmed spend reaches its requested depth.
+// TestOutputLockReleaseAfterSpendAcrossReorg verifies that a lock follows the confirmed spend, resets on rollback, and
+// releases only after the re-confirmed spend reaches its requested depth.
 func TestOutputLockReleaseAfterSpendAcrossReorg(t *testing.T) {
 	t.Parallel()
 
@@ -3147,16 +3122,13 @@ func TestOutputLockReleaseAfterSpendAcrossReorg(t *testing.T) {
 	lockID := LockID{1}
 	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
 		ns := tx.ReadWriteBucket(namespaceKey)
-		expiry, err := store.LockOutput(
-			ns, lockID, creditOutpoint, 10*time.Minute,
-			WithReleaseAfterSpend(3),
-		)
+		expiry, err := store.LockOutput(ns, lockID, creditOutpoint, 10*time.Minute, WithReleaseAfterSpend(3))
 		if err != nil {
 			return err
 		}
 
-		// The first confirmation may arrive after the wall-clock deadline.
-		// Confirmation-controlled leases must still record that spend.
+		// The first confirmation may arrive after the wall-clock deadline. Confirmation-controlled leases must still
+		// record that spend.
 		store.clock.(*clock.TestClock).SetTime(expiry.Add(time.Second))
 		if err := store.DeleteExpiredLockedOutputs(ns); err != nil {
 			return err
@@ -3178,23 +3150,16 @@ func TestOutputLockReleaseAfterSpendAcrossReorg(t *testing.T) {
 			return err
 		}
 
-		// Renewing the lease must preserve the disconnected spend state
-		// and its configured release depth.
-		renewedExpiry, err := store.LockOutput(
-			ns, lockID, creditOutpoint, 10*time.Minute,
-		)
+		// Renewing the lease must preserve the disconnected spend state and its configured release depth.
+		renewedExpiry, err := store.LockOutput(ns, lockID, creditOutpoint, 10*time.Minute)
 		if err != nil {
 			return err
 		}
 
 		assertRetainedLock(t, store, ns, 3, -1)
 
-		// An explicit option replaces the release depth without clearing
-		// the disconnected spend state.
-		_, err = store.LockOutput(
-			ns, lockID, creditOutpoint, 10*time.Minute,
-			WithReleaseAfterSpend(4),
-		)
+		// An explicit option replaces the release depth without clearing the disconnected spend state.
+		_, err = store.LockOutput(ns, lockID, creditOutpoint, 10*time.Minute, WithReleaseAfterSpend(4))
 		if err != nil {
 			return err
 		}
@@ -3205,19 +3170,15 @@ func TestOutputLockReleaseAfterSpendAcrossReorg(t *testing.T) {
 		}
 
 		assertLocked(t, ns, creditOutpoint, store.clock.Now(), true)
-		// The funding credit was restored, but the retained lease keeps
-		// it out of the spendable UTXO set.
+		// The funding credit was restored, but the retained lease keeps it out of the spendable UTXO set.
 		assertUtxos(t, store, ns, nil)
 		if err := store.DeleteMaturedLockedOutputs(ns, 102); err != nil {
 			return err
 		}
 		assertLocked(t, ns, creditOutpoint, store.clock.Now(), true)
 
-		// A lease that has observed a spend must survive its wall clock
-		// expiry while that spend is disconnected.
-		store.clock.(*clock.TestClock).SetTime(
-			renewedExpiry.Add(time.Second),
-		)
+		// A lease that has observed a spend must survive its wall clock expiry while that spend is disconnected.
+		store.clock.(*clock.TestClock).SetTime(renewedExpiry.Add(time.Second))
 		if err := store.DeleteExpiredLockedOutputs(ns); err != nil {
 			return err
 		}

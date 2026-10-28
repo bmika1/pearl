@@ -381,14 +381,11 @@ func (s *Store) RangeTransactions(ns walletdb.ReadBucket, begin, end int32, f fu
 	return err
 }
 
-// BlockHash returns the block hash recorded at height, or nil if that height
-// contains no mined wallet transactions. It can be used to distinguish a
-// matching disconnect from a stale notification before rolling back history.
+// BlockHash returns the block hash recorded at height, or nil if that height contains no mined wallet transactions. It
+// can be used to distinguish a matching disconnect from a stale notification before rolling back history.
 //
 //nolint:nilnil // A height without mined wallet transactions has no block hash.
-func (s *Store) BlockHash(ns walletdb.ReadBucket,
-	height int32) (*chainhash.Hash, error) {
-
+func (s *Store) BlockHash(ns walletdb.ReadBucket, height int32) (*chainhash.Hash, error) {
 	k, v := existsBlockRecord(ns, height)
 	if v == nil {
 		return nil, nil

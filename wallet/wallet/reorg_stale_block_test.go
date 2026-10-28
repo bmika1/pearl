@@ -436,9 +436,8 @@ func TestRollbackToChainStaleManager(t *testing.T) {
 	assert.Equal(t, forkHeight-1, w.Manager.SyncedTo().Height)
 }
 
-// TestRollbackToChainAboveTip ensures a wallet synced past the tip of a shorter
-// chain rewinds to the fork point instead of failing on the heights that chain
-// does not have.
+// TestRollbackToChainAboveTip ensures a wallet synced past the tip of a shorter chain rewinds to the fork point instead
+// of failing on the heights that chain does not have.
 func TestRollbackToChainAboveTip(t *testing.T) {
 	w, cleanup := testWallet(t)
 	defer cleanup()
@@ -456,9 +455,8 @@ func TestRollbackToChainAboveTip(t *testing.T) {
 	assert.Equal(t, branchHash(sharedBranch, forkHeight-1), w.Manager.SyncedTo().Hash)
 }
 
-// TestDisconnectBlockNotChainSynced ensures a disconnect that arrives before
-// the wallet is chain synced still rolls the block back, so its orphaned
-// coinbase does not stay in the balance.
+// TestDisconnectBlockNotChainSynced ensures a disconnect that arrives before the wallet is chain synced still rolls the
+// block back, so its orphaned coinbase does not stay in the balance.
 func TestDisconnectBlockNotChainSynced(t *testing.T) {
 	w, cleanup := testWallet(t)
 	defer cleanup()
@@ -487,9 +485,8 @@ func TestDisconnectBlockNotChainSynced(t *testing.T) {
 	assert.Equal(t, branchHash(sharedBranch, forkHeight-1), w.Manager.SyncedTo().Hash)
 }
 
-// TestDisconnectBlockPrunedAncestors ensures disconnecting an orphaned branch
-// rewinds the manager to a block whose ancestors it has already pruned, and
-// leaves none of the branch's hashes above the new tip.
+// TestDisconnectBlockPrunedAncestors ensures disconnecting an orphaned branch rewinds the manager to a block whose
+// ancestors it has already pruned, and leaves none of the branch's hashes above the new tip.
 func TestDisconnectBlockPrunedAncestors(t *testing.T) {
 	w, cleanup := testWallet(t)
 	defer cleanup()

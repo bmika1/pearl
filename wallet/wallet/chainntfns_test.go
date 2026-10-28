@@ -155,17 +155,12 @@ func addMaturingOutputLock(t *testing.T, w *Wallet, spendHeight int32) {
 			return err
 		}
 
-		err = w.TxStore.AddCredit(
-			ns, creditRec, creditBlock, 0, false,
-		)
+		err = w.TxStore.AddCredit(ns, creditRec, creditBlock, 0, false)
 		if err != nil {
 			return err
 		}
 
-		_, err = w.TxStore.LockOutput(
-			ns, wtxmgr.LockID{1}, creditOutpoint, time.Hour,
-			wtxmgr.WithReleaseAfterSpend(3),
-		)
+		_, err = w.TxStore.LockOutput(ns, wtxmgr.LockID{1}, creditOutpoint, time.Hour, wtxmgr.WithReleaseAfterSpend(3))
 		if err != nil {
 			return err
 		}
@@ -175,8 +170,8 @@ func addMaturingOutputLock(t *testing.T, w *Wallet, spendHeight int32) {
 	require.NoError(t, err)
 }
 
-// TestCatchUpHashesMaturesOutputLocks verifies that offline rescan progress
-// releases retained output leases at the validated catch-up tip.
+// TestCatchUpHashesMaturesOutputLocks verifies that offline rescan progress releases retained output leases at the
+// validated catch-up tip.
 func TestCatchUpHashesMaturesOutputLocks(t *testing.T) {
 	t.Parallel()
 
@@ -189,9 +184,7 @@ func TestCatchUpHashesMaturesOutputLocks(t *testing.T) {
 	)
 	addMaturingOutputLock(t, w, spendHeight)
 
-	chainConn := createMockChainConn(
-		w.chainParams.GenesisBlock, catchUpHeight, defaultBlockInterval,
-	)
+	chainConn := createMockChainConn(w.chainParams.GenesisBlock, catchUpHeight, defaultBlockInterval)
 	err := w.catchUpHashes(chainConn, catchUpHeight)
 	require.NoError(t, err)
 
@@ -424,9 +417,7 @@ func reorgRecord(t *testing.T, n byte) *wtxmgr.TxRecord {
 	t.Helper()
 
 	msg := wire.NewMsgTx(2)
-	msg.AddTxIn(wire.NewTxIn(
-		&wire.OutPoint{Hash: chainhash.Hash{n}}, nil, nil,
-	))
+	msg.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{n}}, nil, nil))
 	msg.AddTxOut(wire.NewTxOut(1000, []byte{0x51}))
 
 	rec, err := wtxmgr.NewTxRecordFromMsgTx(msg, time.Unix(1, 0))
@@ -435,8 +426,8 @@ func reorgRecord(t *testing.T, n byte) *wtxmgr.TxRecord {
 	return rec
 }
 
-// TestDisconnectBlockDuringSync verifies disconnects remove matching history
-// with a matching, lagging, sparse, or already replaced address-manager tip.
+// TestDisconnectBlockDuringSync verifies disconnects remove matching history with a matching, lagging, sparse, or
+// already replaced address-manager tip.
 func TestDisconnectBlockDuringSync(t *testing.T) {
 	t.Parallel()
 
@@ -448,120 +439,105 @@ func TestDisconnectBlockDuringSync(t *testing.T) {
 			wantHeight int32
 			wantHash   chainhash.Hash
 		}{
-			{"behind", 0, *chaincfg.TestNetParams.GenesisHash,
-				0, *chaincfg.TestNetParams.GenesisHash},
-			{"matching", 1, chainhash.Hash{1},
-				0, *chaincfg.TestNetParams.GenesisHash},
-			{"replacement", 1, chainhash.Hash{2},
-				1, chainhash.Hash{2}},
-			{"sparse", 2, chainhash.Hash{5},
-				2, chainhash.Hash{5}},
+			{"behind", 0, *chaincfg.TestNetParams.GenesisHash, 0, *chaincfg.TestNetParams.GenesisHash},
+			{"matching", 1, chainhash.Hash{1}, 0, *chaincfg.TestNetParams.GenesisHash},
+			{"replacement", 1, chainhash.Hash{2}, 1, chainhash.Hash{2}},
+			{"sparse", 2, chainhash.Hash{5}, 2, chainhash.Hash{5}},
 		} {
-			t.Run(fmt.Sprintf("synced=%v/tip=%s", synced, tip.name),
-				func(t *testing.T) {
-					t.Parallel()
+			t.Run(fmt.Sprintf("synced=%v/tip=%s", synced, tip.name), func(t *testing.T) {
+				t.Parallel()
 
-					w, cleanup := testWalletWatchingOnly(t)
-					t.Cleanup(cleanup)
-					t.Cleanup(func() {
-						require.NoError(t, w.db.Close())
-					})
-					w.SetChainSynced(synced)
-					w.chainClient = &mockChainClient{
-						getBlockHeader: &wire.BlockHeader{
-							Timestamp: time.Unix(1, 0),
-						},
-					}
+				w, cleanup := testWalletWatchingOnly(t)
+				t.Cleanup(cleanup)
+				t.Cleanup(func() {
+					require.NoError(t, w.db.Close())
+				})
+				w.SetChainSynced(synced)
+				w.chainClient = &mockChainClient{
+					getBlockHeader: &wire.BlockHeader{
+						Timestamp: time.Unix(1, 0),
+					},
+				}
 
-					old := &wtxmgr.BlockMeta{
+				old := &wtxmgr.BlockMeta{
+					Block: wtxmgr.Block{
+						Height: 1,
+						Hash:   chainhash.Hash{1},
+					},
+					Time: time.Unix(1, 0),
+				}
+				replacement := *old
+				replacement.Hash = chainhash.Hash{2}
+				a, b := reorgRecord(t, 3), reorgRecord(t, 4)
+
+				err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+					require.NoError(t, w.addRelevantTx(tx, a, old))
+
+					return w.connectBlock(tx, wtxmgr.BlockMeta{
 						Block: wtxmgr.Block{
-							Height: 1,
-							Hash:   chainhash.Hash{1},
+							Height: tip.height,
+							Hash:   tip.hash,
 						},
 						Time: time.Unix(1, 0),
-					}
-					replacement := *old
-					replacement.Hash = chainhash.Hash{2}
-					a, b := reorgRecord(t, 3), reorgRecord(t, 4)
-
-					err := walletdb.Update(w.db,
-						func(tx walletdb.ReadWriteTx) error {
-							require.NoError(t, w.addRelevantTx(tx, a, old))
-
-							return w.connectBlock(tx, wtxmgr.BlockMeta{
-								Block: wtxmgr.Block{
-									Height: tip.height,
-									Hash:   tip.hash,
-								},
-								Time: time.Unix(1, 0),
-							})
-						})
-					require.NoError(t, err)
-
-					err = walletdb.Update(w.db,
-						func(tx walletdb.ReadWriteTx) error {
-							return w.disconnectBlock(tx, *old)
-						})
-					require.NoError(t, err)
-
-					require.Equal(
-						t, tip.wantHeight, w.Manager.SyncedTo().Height,
-					)
-					require.Equal(t, tip.wantHash, w.Manager.SyncedTo().Hash)
-
-					err = walletdb.Update(w.db,
-						func(tx walletdb.ReadWriteTx) error {
-							return w.addRelevantTx(tx, b, &replacement)
-						})
-					require.NoError(t, err)
-
-					// A replayed disconnect must not remove the replacement.
-					err = walletdb.Update(w.db,
-						func(tx walletdb.ReadWriteTx) error {
-							return w.disconnectBlock(tx, *old)
-						})
-					require.NoError(t, err)
-
-					// A delayed connection from the other notification
-					// producer can leave the manager on the old block.
-					err = walletdb.Update(w.db,
-						func(tx walletdb.ReadWriteTx) error {
-							return w.connectBlock(tx, *old)
-						})
-					require.NoError(t, err)
-
-					notifications := w.NtfnServer.TransactionNotifications()
-					t.Cleanup(notifications.Done)
-
-					err = walletdb.Update(w.db,
-						func(tx walletdb.ReadWriteTx) error {
-							return w.disconnectBlock(tx, *old)
-						})
-					require.NoError(t, err)
-					require.Equal(t, waddrmgr.BlockStamp{
-						Height:    0,
-						Hash:      *chaincfg.TestNetParams.GenesisHash,
-						Timestamp: time.Unix(1, 0),
-					}, w.Manager.SyncedTo())
-					require.NotNil(t, w.NtfnServer.currentTxNtfn)
-					require.Equal(t, []*chainhash.Hash{&old.Hash},
-						w.NtfnServer.currentTxNtfn.DetachedBlocks)
-
-					result, err := w.GetTransactions(nil, nil, "", nil)
-					require.NoError(t, err)
-					require.Len(t, result.MinedTransactions, 1)
-					require.Len(t, result.UnminedTransactions, 1)
-
-					oldTx, err := w.GetTransaction(a.Hash)
-					require.NoError(t, err)
-					require.EqualValues(t, -1, oldTx.Height)
-					require.Nil(t, oldTx.BlockHash)
-
-					newTx, err := w.GetTransaction(b.Hash)
-					require.NoError(t, err)
-					require.Equal(t, replacement.Height, newTx.Height)
-					require.Equal(t, &replacement.Hash, newTx.BlockHash)
+					})
 				})
+				require.NoError(t, err)
+
+				err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+					return w.disconnectBlock(tx, *old)
+				})
+				require.NoError(t, err)
+
+				require.Equal(t, tip.wantHeight, w.Manager.SyncedTo().Height)
+				require.Equal(t, tip.wantHash, w.Manager.SyncedTo().Hash)
+
+				err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+					return w.addRelevantTx(tx, b, &replacement)
+				})
+				require.NoError(t, err)
+
+				// A replayed disconnect must not remove the replacement.
+				err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+					return w.disconnectBlock(tx, *old)
+				})
+				require.NoError(t, err)
+
+				// A delayed connection from the other notification producer can leave the manager on the old block.
+				err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+					return w.connectBlock(tx, *old)
+				})
+				require.NoError(t, err)
+
+				notifications := w.NtfnServer.TransactionNotifications()
+				t.Cleanup(notifications.Done)
+
+				err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+					return w.disconnectBlock(tx, *old)
+				})
+				require.NoError(t, err)
+				require.Equal(t, waddrmgr.BlockStamp{
+					Height:    0,
+					Hash:      *chaincfg.TestNetParams.GenesisHash,
+					Timestamp: time.Unix(1, 0),
+				}, w.Manager.SyncedTo())
+				require.NotNil(t, w.NtfnServer.currentTxNtfn)
+				require.Equal(t, []*chainhash.Hash{&old.Hash}, w.NtfnServer.currentTxNtfn.DetachedBlocks)
+
+				result, err := w.GetTransactions(nil, nil, "", nil)
+				require.NoError(t, err)
+				require.Len(t, result.MinedTransactions, 1)
+				require.Len(t, result.UnminedTransactions, 1)
+
+				oldTx, err := w.GetTransaction(a.Hash)
+				require.NoError(t, err)
+				require.EqualValues(t, -1, oldTx.Height)
+				require.Nil(t, oldTx.BlockHash)
+
+				newTx, err := w.GetTransaction(b.Hash)
+				require.NoError(t, err)
+				require.Equal(t, replacement.Height, newTx.Height)
+				require.Equal(t, &replacement.Hash, newTx.BlockHash)
+			})
 		}
 	}
 }
@@ -587,8 +563,7 @@ func (c *reorgChainClient) GetBestBlock() (*chainhash.Hash, int32, error) {
 func (c *reorgChainClient) GetBlockHash(height int64) (*chainhash.Hash, error) {
 	hash, ok := c.blockHashes[height]
 	if !ok {
-		return nil, fmt.Errorf("block hash at height %d: %w",
-			height, errReorgBackend)
+		return nil, fmt.Errorf("block hash at height %d: %w", height, errReorgBackend)
 	}
 
 	return &hash, nil
@@ -602,9 +577,8 @@ type mixedHistoryCase struct {
 	bestErr bool
 }
 
-// TestDisconnectMixedHistory covers every canonical/orphan arrangement across
-// three stored heights, with and without a record at the disconnected height.
-// The all-orphan case also covers disconnects of empty blocks.
+// TestDisconnectMixedHistory covers every canonical/orphan arrangement across three stored heights, with and without a
+// record at the disconnected height. The all-orphan case also covers disconnects of empty blocks.
 func TestDisconnectMixedHistory(t *testing.T) {
 	t.Parallel()
 
@@ -624,86 +598,78 @@ func TestDisconnectMixedHistory(t *testing.T) {
 	}
 	for _, stored := range []bool{false, true} {
 		for _, test := range tests {
-			t.Run(fmt.Sprintf("stored=%v/%s", stored, test.name),
-				func(t *testing.T) {
-					t.Parallel()
+			t.Run(fmt.Sprintf("stored=%v/%s", stored, test.name), func(t *testing.T) {
+				t.Parallel()
 
-					w, cleanup := testWalletWatchingOnly(t)
-					t.Cleanup(cleanup)
-					t.Cleanup(func() { require.NoError(t, w.db.Close()) })
+				w, cleanup := testWalletWatchingOnly(t)
+				t.Cleanup(cleanup)
+				t.Cleanup(func() { require.NoError(t, w.db.Close()) })
 
-					client := &reorgChainClient{
-						mockChainClient: &mockChainClient{
-							getBestBlockHeight: test.tip,
-							getBlockHeader: &wire.BlockHeader{
-								Timestamp: time.Unix(1, 0),
-							},
+				client := &reorgChainClient{
+					mockChainClient: &mockChainClient{
+						getBestBlockHeight: test.tip,
+						getBlockHeader: &wire.BlockHeader{
+							Timestamp: time.Unix(1, 0),
 						},
-						blockHashes: map[int64]chainhash.Hash{1: {9}},
-					}
-					if test.bestErr {
-						client.bestErr = errReorgBackend
-					}
+					},
+					blockHashes: map[int64]chainhash.Hash{1: {9}},
+				}
+				if test.bestErr {
+					client.bestErr = errReorgBackend
+				}
 
-					w.chainClient = client
+				w.chainClient = client
 
-					old := reorgBlock(1)
-					replacement := old
-					replacement.Hash = chainhash.Hash{9}
-					records, heights, wantHeights := mixedHistoryRecords(
-						t, stored, test, client,
-					)
+				old := reorgBlock(1)
+				replacement := old
+				replacement.Hash = chainhash.Hash{9}
+				records, heights, wantHeights := mixedHistoryRecords(t, stored, test, client)
 
-					delete(client.blockHashes, test.missing)
+				delete(client.blockHashes, test.missing)
 
-					wantErr := test.bestErr || test.missing != 0
-					if wantErr {
-						wantHeights = heights
-					}
+				wantErr := test.bestErr || test.missing != 0
+				if wantErr {
+					wantHeights = heights
+				}
 
-					require.NoError(t, walletdb.Update(w.db,
-						func(tx walletdb.ReadWriteTx) error {
-							require.NoError(t, w.connectBlock(tx, replacement))
-							// Higher records arrive before the old block.
-							for i := len(records) - 1; i >= 0; i-- {
-								block := reorgBlock(heights[i])
-								addReorgCredit(
-									t, w, tx, records[i], &block, i%2 != 0,
-								)
-							}
-
-							return w.connectBlock(tx, old)
-						}))
-
-					err := walletdb.Update(w.db,
-						func(tx walletdb.ReadWriteTx) error {
-							return w.disconnectBlock(tx, old)
-						})
-					if wantErr {
-						require.ErrorIs(t, err, errReorgBackend)
-						require.Equal(t, old.Hash, w.Manager.SyncedTo().Hash)
-					} else {
-						require.NoError(t, err)
-						require.Zero(t, w.Manager.SyncedTo().Height)
+				require.NoError(t, walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+					require.NoError(t, w.connectBlock(tx, replacement))
+					// Higher records arrive before the old block.
+					for i := len(records) - 1; i >= 0; i-- {
+						block := reorgBlock(heights[i])
+						addReorgCredit(t, w, tx, records[i], &block, i%2 != 0)
 					}
 
-					assertReorgHistory(t, w, records, wantHeights)
+					return w.connectBlock(tx, old)
+				}))
 
-					if !wantErr {
-						// A duplicate detach must not change the result.
-						require.NoError(t, walletdb.Update(w.db,
-							func(tx walletdb.ReadWriteTx) error {
-								return w.disconnectBlock(tx, old)
-							}))
-						assertReorgHistory(t, w, records, wantHeights)
-					}
+				err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+					return w.disconnectBlock(tx, old)
 				})
+				if wantErr {
+					require.ErrorIs(t, err, errReorgBackend)
+					require.Equal(t, old.Hash, w.Manager.SyncedTo().Hash)
+				} else {
+					require.NoError(t, err)
+					require.Zero(t, w.Manager.SyncedTo().Height)
+				}
+
+				assertReorgHistory(t, w, records, wantHeights)
+
+				if !wantErr {
+					// A duplicate detach must not change the result.
+					require.NoError(t, walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+						return w.disconnectBlock(tx, old)
+					}))
+					assertReorgHistory(t, w, records, wantHeights)
+				}
+			})
 		}
 	}
 }
 
-func mixedHistoryRecords(t *testing.T, stored bool, test mixedHistoryCase,
-	client *reorgChainClient) ([]*wtxmgr.TxRecord, []int32, []int32) {
+func mixedHistoryRecords(t *testing.T, stored bool, test mixedHistoryCase, client *reorgChainClient) (
+	[]*wtxmgr.TxRecord, []int32, []int32) {
 
 	t.Helper()
 
@@ -746,19 +712,15 @@ func reorgBlock(height int32) wtxmgr.BlockMeta {
 	}
 }
 
-func addReorgCredit(t *testing.T, w *Wallet, tx walletdb.ReadWriteTx,
-	record *wtxmgr.TxRecord, block *wtxmgr.BlockMeta, change bool) {
+func addReorgCredit(t *testing.T, w *Wallet, tx walletdb.ReadWriteTx, record *wtxmgr.TxRecord, block *wtxmgr.BlockMeta,
+	change bool) {
 
 	t.Helper()
 	require.NoError(t, w.addRelevantTx(tx, record, block))
-	require.NoError(t, w.TxStore.AddCredit(
-		tx.ReadWriteBucket(wtxmgrNamespaceKey), record, block, 0, change,
-	))
+	require.NoError(t, w.TxStore.AddCredit(tx.ReadWriteBucket(wtxmgrNamespaceKey), record, block, 0, change))
 }
 
-func assertReorgHistory(t *testing.T, w *Wallet,
-	records []*wtxmgr.TxRecord, heights []int32) {
-
+func assertReorgHistory(t *testing.T, w *Wallet, records []*wtxmgr.TxRecord, heights []int32) {
 	t.Helper()
 	require.NoError(t, walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		ns := tx.ReadBucket(wtxmgrNamespaceKey)
@@ -794,9 +756,7 @@ func assertReorgHistory(t *testing.T, w *Wallet,
 	}))
 }
 
-func reorgSpend(t *testing.T, parent *wtxmgr.TxRecord,
-	amount int64) *wtxmgr.TxRecord {
-
+func reorgSpend(t *testing.T, parent *wtxmgr.TxRecord, amount int64) *wtxmgr.TxRecord {
 	t.Helper()
 
 	msg := wire.NewMsgTx(2)
@@ -812,8 +772,7 @@ func reorgCoinbase(t *testing.T, tag byte) *wtxmgr.TxRecord {
 	t.Helper()
 
 	msg := wire.NewMsgTx(2)
-	msg.AddTxIn(wire.NewTxIn(&wire.OutPoint{Index: ^uint32(0)},
-		[]byte{tag}, nil))
+	msg.AddTxIn(wire.NewTxIn(&wire.OutPoint{Index: ^uint32(0)}, []byte{tag}, nil))
 	msg.AddTxOut(wire.NewTxOut(1000, []byte{0x51}))
 	rec, err := wtxmgr.NewTxRecordFromMsgTx(msg, time.Unix(1, 0))
 	require.NoError(t, err)
@@ -821,8 +780,8 @@ func reorgCoinbase(t *testing.T, tag byte) *wtxmgr.TxRecord {
 	return rec
 }
 
-// TestDisconnectCoinbaseSpends covers canonical coinbases, same-block debit
-// order, unmined descendants, orphaned coinbase cleanup, labels and leases.
+// TestDisconnectCoinbaseSpends covers canonical coinbases, same-block debit order, unmined descendants, orphaned
+// coinbase cleanup, labels and leases.
 func TestDisconnectCoinbaseSpends(t *testing.T) {
 	t.Parallel()
 
@@ -841,8 +800,8 @@ func TestDisconnectCoinbaseSpends(t *testing.T) {
 	}
 	old := reorgRecord(t, 60)
 	coinbaseMsg := reorgCoinbase(t, 61).MsgTx
-	// Output 0 stays spent, output 1 becomes unspent when the mixed
-	// descendant is removed, and output 2 stays unspent throughout.
+	// Output 0 stays spent, output 1 becomes unspent when the mixed descendant is removed, and output 2 stays unspent
+	// throughout.
 	coinbaseMsg.AddTxOut(wire.NewTxOut(1000, []byte{0x51}))
 	coinbaseMsg.AddTxOut(wire.NewTxOut(1000, []byte{0x51}))
 	coinbase, err := wtxmgr.NewTxRecordFromMsgTx(&coinbaseMsg, time.Unix(1, 0))
@@ -855,18 +814,14 @@ func TestDisconnectCoinbaseSpends(t *testing.T) {
 	orphanCoinbase := reorgCoinbase(t, 62)
 	orphanPending := reorgSpend(t, orphanCoinbase, 900)
 	orphanPendingChild := reorgSpend(t, orphanPending, 800)
-	// A transaction with both valid and orphaned coinbase ancestry must
-	// not be resurrected when the valid ancestry is restored.
+	// A transaction with both valid and orphaned coinbase ancestry must not be resurrected when the valid ancestry is
+	// restored.
 	mixedMsg := wire.NewMsgTx(2)
 	for _, rec := range []*wtxmgr.TxRecord{pendingChild, orphanPendingChild} {
-		mixedMsg.AddTxIn(wire.NewTxIn(
-			&wire.OutPoint{Hash: rec.Hash}, nil, nil,
-		))
+		mixedMsg.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: rec.Hash}, nil, nil))
 	}
 
-	mixedMsg.AddTxIn(wire.NewTxIn(
-		&wire.OutPoint{Hash: coinbase.Hash, Index: 1}, nil, nil,
-	))
+	mixedMsg.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: coinbase.Hash, Index: 1}, nil, nil))
 	mixedMsg.AddTxOut(wire.NewTxOut(2300, []byte{0x51}))
 	mixed, err := wtxmgr.NewTxRecordFromMsgTx(mixedMsg, time.Unix(1, 0))
 	require.NoError(t, err)
@@ -882,13 +837,10 @@ func TestDisconnectCoinbaseSpends(t *testing.T) {
 		addReorgCredit(t, w, tx, coinbase, &coinbaseBlock, false)
 
 		for _, index := range []uint32{1, 2} {
-			require.NoError(t, w.TxStore.AddCredit(
-				ns, coinbase, &coinbaseBlock, index, false,
-			))
+			require.NoError(t, w.TxStore.AddCredit(ns, coinbase, &coinbaseBlock, index, false))
 		}
 
-		_, err := w.TxStore.LockOutput(ns, leaseID, outpoint, time.Hour,
-			wtxmgr.WithReleaseAfterSpend(200))
+		_, err := w.TxStore.LockOutput(ns, leaseID, outpoint, time.Hour, wtxmgr.WithReleaseAfterSpend(200))
 		require.NoError(t, err)
 		addReorgCredit(t, w, tx, parent, &spendBlock, true)
 		addReorgCredit(t, w, tx, child, &spendBlock, false)
@@ -913,8 +865,8 @@ func TestDisconnectCoinbaseSpends(t *testing.T) {
 		notify(hash, index)
 	}
 
-	// An error after successful replay must discard queued notifications
-	// along with the database changes. Retry against the same history.
+	// An error after successful replay must discard queued notifications along with the database changes. Retry against
+	// the same history.
 	abortErr := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		ns := tx.ReadWriteBucket(wtxmgrNamespaceKey)
 		require.NoError(t, w.rollbackBlockHistory(ns, oldBlock.Height))
@@ -924,16 +876,15 @@ func TestDisconnectCoinbaseSpends(t *testing.T) {
 	})
 	require.ErrorIs(t, abortErr, errReorgWrite)
 	require.Empty(t, unspent)
-	require.NoError(t, walletdb.Update(w.db,
-		func(tx walletdb.ReadWriteTx) error {
-			err := w.disconnectBlock(tx, oldBlock)
+	require.NoError(t, walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		err := w.disconnectBlock(tx, oldBlock)
 
-			require.Empty(t, unspent)
+		require.Empty(t, unspent)
 
-			return err
-		}))
-	// Only removing the mixed-ancestry spend changes spentness. Unchanged
-	// spent and unspent credits must not produce replay notifications.
+		return err
+	}))
+	// Only removing the mixed-ancestry spend changes spentness. Unchanged spent and unspent credits must not produce
+	// replay notifications.
 	require.ElementsMatch(t, []wire.OutPoint{
 		{Hash: pendingChild.Hash}, {Hash: coinbase.Hash, Index: 1},
 	}, unspent)
@@ -1007,8 +958,8 @@ func TestDisconnectCoinbaseSpends(t *testing.T) {
 	}))
 }
 
-// TestDisconnectConflictingSpends verifies replay removes orphaned double
-// spends and their unmined children while rebuilding the canonical debit.
+// TestDisconnectConflictingSpends verifies replay removes orphaned double spends and their unmined children while
+// rebuilding the canonical debit.
 func TestDisconnectConflictingSpends(t *testing.T) {
 	t.Parallel()
 
@@ -1029,19 +980,17 @@ func TestDisconnectConflictingSpends(t *testing.T) {
 	canonical := reorgSpend(t, funding, 700)
 	fundingBlock := reorgBlock(0)
 	oldBlock, newBlock := reorgBlock(1), reorgBlock(2)
-	require.NoError(t, walletdb.Update(w.db,
-		func(tx walletdb.ReadWriteTx) error {
-			addReorgCredit(t, w, tx, funding, &fundingBlock, false)
-			addReorgCredit(t, w, tx, orphan, &oldBlock, false)
-			addReorgCredit(t, w, tx, orphanChild, nil, false)
-			addReorgCredit(t, w, tx, canonical, &newBlock, true)
+	require.NoError(t, walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		addReorgCredit(t, w, tx, funding, &fundingBlock, false)
+		addReorgCredit(t, w, tx, orphan, &oldBlock, false)
+		addReorgCredit(t, w, tx, orphanChild, nil, false)
+		addReorgCredit(t, w, tx, canonical, &newBlock, true)
 
-			return w.connectBlock(tx, oldBlock)
-		}))
-	require.NoError(t, walletdb.Update(w.db,
-		func(tx walletdb.ReadWriteTx) error {
-			return w.disconnectBlock(tx, oldBlock)
-		}))
+		return w.connectBlock(tx, oldBlock)
+	}))
+	require.NoError(t, walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		return w.disconnectBlock(tx, oldBlock)
+	}))
 	require.NoError(t, walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		ns := tx.ReadBucket(wtxmgrNamespaceKey)
 		for _, rec := range []*wtxmgr.TxRecord{orphan, orphanChild} {
@@ -1068,8 +1017,8 @@ func TestDisconnectConflictingSpends(t *testing.T) {
 
 var errReorgWrite = errors.New("reorg replay write failed")
 
-// failingReorgBucket rejects writes of one saved block hash. This forces an
-// error during replay, after the original records have been rolled back.
+// failingReorgBucket rejects writes of one saved block hash. This forces an error during replay, after the original
+// records have been rolled back.
 type failingReorgBucket struct {
 	walletdb.ReadWriteBucket
 
@@ -1077,9 +1026,7 @@ type failingReorgBucket struct {
 }
 
 //nolint:ireturn // Implements the walletdb bucket interface.
-func (b failingReorgBucket) NestedReadWriteBucket(
-	key []byte) walletdb.ReadWriteBucket {
-
+func (b failingReorgBucket) NestedReadWriteBucket(key []byte) walletdb.ReadWriteBucket {
 	bucket := b.ReadWriteBucket.NestedReadWriteBucket(key)
 	if bucket == nil {
 		return nil
@@ -1090,9 +1037,7 @@ func (b failingReorgBucket) NestedReadWriteBucket(
 
 func (b failingReorgBucket) Put(key, value []byte) error {
 	// A block record starts with its hash. Rollback writes no block records.
-	if len(key) == 4 && len(value) >= 32 &&
-		bytes.Equal(value[:32], b.failHash[:]) {
-
+	if len(key) == 4 && len(value) >= 32 && bytes.Equal(value[:32], b.failHash[:]) {
 		return fmt.Errorf("restore block: %w", errReorgWrite)
 	}
 
@@ -1114,15 +1059,14 @@ func TestDisconnectReplayFailure(t *testing.T) {
 		reorgRecord(t, 80), reorgRecord(t, 81), reorgRecord(t, 82),
 	}
 	heights := []int32{1, 2, 3}
-	require.NoError(t, walletdb.Update(w.db,
-		func(tx walletdb.ReadWriteTx) error {
-			for i, rec := range records {
-				block := reorgBlock(heights[i])
-				addReorgCredit(t, w, tx, rec, &block, i%2 != 0)
-			}
+	require.NoError(t, walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		for i, rec := range records {
+			block := reorgBlock(heights[i])
+			addReorgCredit(t, w, tx, rec, &block, i%2 != 0)
+		}
 
-			return nil
-		}))
+		return nil
+	}))
 	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		ns := failingReorgBucket{
 			ReadWriteBucket: tx.ReadWriteBucket(wtxmgrNamespaceKey),
@@ -1135,8 +1079,8 @@ func TestDisconnectReplayFailure(t *testing.T) {
 	assertReorgHistory(t, w, records, heights)
 }
 
-// TestDisconnectOrphanCoinbaseSpend checks that a normal transaction detached
-// from an orphan block survives as unmined when its coinbase ancestor is valid.
+// TestDisconnectOrphanCoinbaseSpend checks that a normal transaction detached from an orphan block survives as unmined
+// when its coinbase ancestor is valid.
 func TestDisconnectOrphanCoinbaseSpend(t *testing.T) {
 	t.Parallel()
 

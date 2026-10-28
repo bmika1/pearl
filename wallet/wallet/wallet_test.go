@@ -668,20 +668,16 @@ func TestEndRecovery(t *testing.T) {
 	}
 }
 
-// newRecoveryTestState creates the recovery state and scoped-manager map used
-// by a production recovery run, including state already persisted in walletdb.
-func newRecoveryTestState(t *testing.T, w *Wallet) (*RecoveryManager,
-	map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager) {
+// newRecoveryTestState creates the recovery state and scoped-manager map used by a production recovery run, including
+// state already persisted in walletdb.
+func newRecoveryTestState(t *testing.T, w *Wallet) (
+	*RecoveryManager, map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager) {
 
 	t.Helper()
 
-	recoveryMgr := NewRecoveryManager(
-		w.recoveryWindow, recoveryBatchSize, w.chainParams,
-	)
+	recoveryMgr := NewRecoveryManager(w.recoveryWindow, recoveryBatchSize, w.chainParams)
 
-	scopedMgrs := make(
-		map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager,
-	)
+	scopedMgrs := make(map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager)
 	for _, scopedMgr := range w.Manager.ActiveScopedKeyManagers() {
 		scopedMgrs[scopedMgr.Scope()] = scopedMgr
 	}
@@ -704,9 +700,7 @@ func newRecoveryTestState(t *testing.T, w *Wallet) (*RecoveryManager,
 }
 
 // newRecoveryTestBlock returns matching filter and sync records for a block.
-func newRecoveryTestBlock(height int32) (wtxmgr.BlockMeta,
-	*waddrmgr.BlockStamp) {
-
+func newRecoveryTestBlock(height int32) (wtxmgr.BlockMeta, *waddrmgr.BlockStamp) {
 	var hash chainhash.Hash
 
 	hash[0] = byte(height)
@@ -728,13 +722,12 @@ func newRecoveryTestBlock(height int32) (wtxmgr.BlockMeta,
 	return blockMeta, blockStamp
 }
 
-// newRecoveryTestResponse builds a filter response for the highest external
-// address in a scope and a transaction that pays to that address.
+// newRecoveryTestResponse builds a filter response for the highest external address in a scope and a transaction that
+// pays to that address.
 //
 //nolint:ireturn
-func newRecoveryTestResponse(req *chain.FilterBlocksRequest,
-	scope waddrmgr.KeyScope, value int64) (*chain.FilterBlocksResponse,
-	btcutil.Address, uint32, *wire.MsgTx, error) {
+func newRecoveryTestResponse(req *chain.FilterBlocksRequest, scope waddrmgr.KeyScope, value int64) (
+	*chain.FilterBlocksResponse, btcutil.Address, uint32, *wire.MsgTx, error) {
 
 	var (
 		recoveredAddr  btcutil.Address
@@ -778,11 +771,9 @@ func newRecoveryTestResponse(req *chain.FilterBlocksRequest,
 	return response, recoveredAddr, recoveredIndex, relevantTx, nil
 }
 
-// TestRecoveryFilterBlocksDoesNotHoldWriter verifies that a chain backend can
-// obtain a wallet database write transaction while FilterBlocks is running.
-// A network-backed backend may block for an unbounded amount of time, so
-// holding the writer across this call would also block every unrelated wallet
-// operation that needs to persist state.
+// TestRecoveryFilterBlocksDoesNotHoldWriter verifies that a chain backend can obtain a wallet database write
+// transaction while FilterBlocks is running. A network-backed backend may block for an unbounded amount of time, so
+// holding the writer across this call would also block every unrelated wallet operation that needs to persist state.
 func TestRecoveryFilterBlocksDoesNotHoldWriter(t *testing.T) {
 	t.Parallel()
 
@@ -799,17 +790,14 @@ func TestRecoveryFilterBlocksDoesNotHoldWriter(t *testing.T) {
 	errWriterHeld := errors.New("wallet writer held during FilterBlocks")
 	filterCalls := 0
 	chainClient := &mockChainClient{}
-	chainClient.filterBlocksFunc = func(*chain.FilterBlocksRequest) (
-		*chain.FilterBlocksResponse, error) {
-
+	chainClient.filterBlocksFunc = func(*chain.FilterBlocksRequest) (*chain.FilterBlocksResponse, error) {
 		filterCalls++
 
 		writerDone := make(chan error, 1)
 		go func() {
-			writerDone <- walletdb.Update(
-				w.db, func(walletdb.ReadWriteTx) error {
-					return nil
-				},
+			writerDone <- walletdb.Update(w.db, func(walletdb.ReadWriteTx) error {
+				return nil
+			},
 			)
 		}()
 
@@ -822,16 +810,13 @@ func TestRecoveryFilterBlocksDoesNotHoldWriter(t *testing.T) {
 		}
 	}
 
-	err := w.recoverBatch(
-		chainClient, batch, blocks, recoveryMgr.State(), scopedMgrs,
-	)
+	err := w.recoverBatch(chainClient, batch, blocks, recoveryMgr.State(), scopedMgrs)
 	require.NoError(t, err)
 	require.Equal(t, 1, filterCalls)
 }
 
-// TestRecoveryFilterBlocksSerializesAddressCreation verifies that a recovery
-// request's address horizon stays fixed until the batch is committed. Address
-// creation may continue as soon as the backend call returns.
+// TestRecoveryFilterBlocksSerializesAddressCreation verifies that a recovery request's address horizon stays fixed
+// until the batch is committed. Address creation may continue as soon as the backend call returns.
 func TestRecoveryFilterBlocksSerializesAddressCreation(t *testing.T) {
 	t.Parallel()
 
@@ -845,9 +830,7 @@ func TestRecoveryFilterBlocksSerializesAddressCreation(t *testing.T) {
 	batch := []wtxmgr.BlockMeta{blockMeta}
 	blocks := []*waddrmgr.BlockStamp{blockStamp}
 
-	errAddressNotSerialized := errors.New(
-		"address creation completed before recovery commit",
-	)
+	errAddressNotSerialized := errors.New("address creation completed before recovery commit")
 	addressDone := make(chan error, 1)
 	filterCalls := 0
 	expectedSync := *blockStamp
@@ -860,19 +843,14 @@ func TestRecoveryFilterBlocksSerializesAddressCreation(t *testing.T) {
 
 		return nil
 	}
-	chainClient.filterBlocksFunc = func(*chain.FilterBlocksRequest) (
-		*chain.FilterBlocksResponse, error) {
-
+	chainClient.filterBlocksFunc = func(*chain.FilterBlocksRequest) (*chain.FilterBlocksResponse, error) {
 		filterCalls++
 
 		addressGoroutineStarted := make(chan struct{})
 		go func() {
 			close(addressGoroutineStarted)
 
-			_, err := w.NewAddress(
-				waddrmgr.DefaultAccountNum,
-				waddrmgr.KeyScopeBIP0086,
-			)
+			_, err := w.NewAddress(waddrmgr.DefaultAccountNum, waddrmgr.KeyScopeBIP0086)
 			addressDone <- err
 		}()
 
@@ -893,9 +871,7 @@ func TestRecoveryFilterBlocksSerializesAddressCreation(t *testing.T) {
 	}
 	w.chainClient = chainClient
 
-	err := w.recoverBatch(
-		chainClient, batch, blocks, recoveryMgr.State(), scopedMgrs,
-	)
+	err := w.recoverBatch(chainClient, batch, blocks, recoveryMgr.State(), scopedMgrs)
 	require.NoError(t, err)
 	require.Equal(t, 1, filterCalls)
 	require.Equal(t, expectedSync, w.Manager.SyncedTo())
@@ -909,9 +885,8 @@ func TestRecoveryFilterBlocksSerializesAddressCreation(t *testing.T) {
 	}
 }
 
-// TestRecoveryBatchCommitsResults verifies that discoveries from multiple
-// backend calls and the synced-to marker are committed together after the
-// backend finishes filtering.
+// TestRecoveryBatchCommitsResults verifies that discoveries from multiple backend calls and the synced-to marker are
+// committed together after the backend finishes filtering.
 func TestRecoveryBatchCommitsResults(t *testing.T) {
 	t.Parallel()
 
@@ -937,38 +912,27 @@ func TestRecoveryBatchCommitsResults(t *testing.T) {
 	)
 
 	chainClient := &mockChainClient{}
-	chainClient.filterBlocksFunc = func(req *chain.FilterBlocksRequest) (
-		*chain.FilterBlocksResponse, error) {
-
+	chainClient.filterBlocksFunc = func(req *chain.FilterBlocksRequest) (*chain.FilterBlocksResponse, error) {
 		filterCalls++
 		if filterCalls == 3 {
-			// A nil response means the backend scanned the rest of the
-			// batch without another match.
+			// A nil response means the backend scanned the rest of the batch without another match.
 			return nil, nil //nolint:nilnil
 		}
 
-		response, recoveredAddr, recoveredIndex, relevantTx, err :=
-			newRecoveryTestResponse(
-				req, scope, int64(1000+filterCalls),
-			)
+		response, recoveredAddr, recoveredIndex, relevantTx, err := newRecoveryTestResponse(req, scope,
+			int64(1000+filterCalls))
 		if err != nil {
 			return nil, err
 		}
 
-		recoveredAddrs = append(
-			recoveredAddrs, recoveredAddr,
-		)
-		recoveredIndexes = append(
-			recoveredIndexes, recoveredIndex,
-		)
+		recoveredAddrs = append(recoveredAddrs, recoveredAddr)
+		recoveredIndexes = append(recoveredIndexes, recoveredIndex)
 		relevantTxns = append(relevantTxns, relevantTx)
 
 		return response, nil
 	}
 
-	err := w.recoverBatch(
-		chainClient, batch, blocks, recoveryMgr.State(), scopedMgrs,
-	)
+	err := w.recoverBatch(chainClient, batch, blocks, recoveryMgr.State(), scopedMgrs)
 	require.NoError(t, err)
 	require.Equal(t, 3, filterCalls)
 	require.Equal(t, *thirdStamp, w.Manager.SyncedTo())
@@ -986,24 +950,18 @@ func TestRecoveryBatchCommitsResults(t *testing.T) {
 
 		var err error
 
-		accountProps, err = scopedMgr.AccountProperties(
-			addrMgrNS, waddrmgr.DefaultAccountNum,
-		)
+		accountProps, err = scopedMgr.AccountProperties(addrMgrNS, waddrmgr.DefaultAccountNum)
 		if err != nil {
 			return err
 		}
 
 		for _, recoveredAddr := range recoveredAddrs {
-			managedAddr, err := scopedMgr.Address(
-				addrMgrNS, recoveredAddr,
-			)
+			managedAddr, err := scopedMgr.Address(addrMgrNS, recoveredAddr)
 			if err != nil {
 				return err
 			}
 
-			addressesUsed = append(
-				addressesUsed, managedAddr.Used(addrMgrNS),
-			)
+			addressesUsed = append(addressesUsed, managedAddr.Used(addrMgrNS))
 		}
 
 		txMgrNS := tx.ReadBucket(wtxmgrNamespaceKey)
@@ -1021,17 +979,15 @@ func TestRecoveryBatchCommitsResults(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
-	require.Equal(t, recoveredIndexes[len(recoveredIndexes)-1]+1,
-		accountProps.ExternalKeyCount)
+	require.Equal(t, recoveredIndexes[len(recoveredIndexes)-1]+1, accountProps.ExternalKeyCount)
 	require.Equal(t, []bool{true, true}, addressesUsed)
 	require.Len(t, txDetails, 2)
 	require.NotNil(t, txDetails[0])
 	require.NotNil(t, txDetails[1])
 }
 
-// TestRecoveryBatchFilterErrorRollsBack verifies that an error from a later
-// backend request cannot leave earlier discoveries or a newer synced-to marker
-// in walletdb.
+// TestRecoveryBatchFilterErrorRollsBack verifies that an error from a later backend request cannot leave earlier
+// discoveries or a newer synced-to marker in walletdb.
 func TestRecoveryBatchFilterErrorRollsBack(t *testing.T) {
 	t.Parallel()
 
@@ -1059,9 +1015,7 @@ func TestRecoveryBatchFilterErrorRollsBack(t *testing.T) {
 
 		var err error
 
-		initialProps, err = scopedMgrs[scope].AccountProperties(
-			addrMgrNS, waddrmgr.DefaultAccountNum,
-		)
+		initialProps, err = scopedMgrs[scope].AccountProperties(addrMgrNS, waddrmgr.DefaultAccountNum)
 
 		return err
 	})
@@ -1069,17 +1023,13 @@ func TestRecoveryBatchFilterErrorRollsBack(t *testing.T) {
 
 	errLaterFilter := errors.New("later FilterBlocks call failed")
 	chainClient := &mockChainClient{}
-	chainClient.filterBlocksFunc = func(req *chain.FilterBlocksRequest) (
-		*chain.FilterBlocksResponse, error) {
-
+	chainClient.filterBlocksFunc = func(req *chain.FilterBlocksRequest) (*chain.FilterBlocksResponse, error) {
 		filterCalls++
 		if filterCalls > 1 {
 			return nil, errLaterFilter
 		}
 
-		response, _, _, transaction, err := newRecoveryTestResponse(
-			req, scope, 1000,
-		)
+		response, _, _, transaction, err := newRecoveryTestResponse(req, scope, 1000)
 		if err != nil {
 			return nil, err
 		}
@@ -1089,9 +1039,7 @@ func TestRecoveryBatchFilterErrorRollsBack(t *testing.T) {
 		return response, nil
 	}
 
-	err = w.recoverBatch(
-		chainClient, batch, blocks, recoveryMgr.State(), scopedMgrs,
-	)
+	err = w.recoverBatch(chainClient, batch, blocks, recoveryMgr.State(), scopedMgrs)
 	require.ErrorIs(t, err, errLaterFilter)
 	require.Equal(t, 2, filterCalls)
 	require.Equal(t, initialSync, w.Manager.SyncedTo())
@@ -1106,9 +1054,7 @@ func TestRecoveryBatchFilterErrorRollsBack(t *testing.T) {
 
 		var err error
 
-		finalProps, err = scopedMgrs[scope].AccountProperties(
-			addrMgrNS, waddrmgr.DefaultAccountNum,
-		)
+		finalProps, err = scopedMgrs[scope].AccountProperties(addrMgrNS, waddrmgr.DefaultAccountNum)
 		if err != nil {
 			return err
 		}
@@ -1120,8 +1066,7 @@ func TestRecoveryBatchFilterErrorRollsBack(t *testing.T) {
 		return err
 	})
 	require.NoError(t, err)
-	require.Equal(t, initialProps.ExternalKeyCount,
-		finalProps.ExternalKeyCount)
+	require.Equal(t, initialProps.ExternalKeyCount, finalProps.ExternalKeyCount)
 	require.Nil(t, txDetails)
 }
 
