@@ -131,6 +131,10 @@ Each rig has its own token, so a leaked token only lets someone write to that ri
   prefill almost exclusively; prefix caching is disabled so no work is skipped.
 - **The gateway errors until the node is synced**, so `run.sh` waits on `getblocktemplate`
   succeeding before starting it.
+- **Measured on H200 NVL (2026-10-29):** ~270 TH/s with the 70B model at a 16k batch cap, ~278 TH/s
+  at 32k (now the default). The 8B model is slower (~208 TH/s): bigger GEMMs amortise the per-GEMM
+  weight hashing better. Pools report ~700 TH/s for bare-GEMM miners on the same card; the vLLM path
+  pays for attention, quantisation, hashing and noising on top of the matmuls.
 - **Work-rate unit.** `inner_hash_per_matmul` counts the hash-tile int8 operations the kernel
   commits to; pools call the same thing "hashes". Treat the TH/s figure as comparable to pool
   dashboards within ~10%.

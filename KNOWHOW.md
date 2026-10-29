@@ -153,3 +153,21 @@ only clears at ≲ $0.40/h for a 5090-class card.
   matches its own command line); anchor it: `pkill -f "^bash /workspace/ops/run.sh"`.
   (4) The compiled pearl_gemm extension needs torch/lib on LD_LIBRARY_PATH when imported
   before torch; bootstrap/run.sh export it. Build took ~9 min, model pull ~12 min.
+- RIG 1 FIRST HASHES (2026-10-29 18:15 UTC): node synced ~2h after start (one 9-min peer stall,
+  one 2-min self-inflicted pearld stop). vLLM 70B loaded in ~3 min. Work rate steady at
+  ~270 TH/s (= 270 T int8-MAC/s; 1 "inner hash" == 1 MAC in our accounting), avg m ≈ 15k tokens
+  per noisy GEMM (max_num_batched_tokens 16384 is the cap), GPU 99 % @ 583 W, loadgen 2.1 req/s,
+  ~6.1k prompt tok/s. That is ~40 % of the ~700 TH/s pools report for an H200 NVL: pool miners run
+  bare GEMMs; the vLLM path also pays attention, norms, activation quantisation, per-GEMM tensor
+  hashing of A and B, and noising kernels. Expected solo yield at this rate: ~0.0017 blocks/day.
+  Idea to test on rig 2: smaller model (Llama-3.1-8B-pearl) may give more MAC/s (less non-GEMM overhead).
+- RIG 2 (Japan, instance 58284662, alias pearl-rig2 144.79.51.1:50088): bootstrap 6 min, chain
+  seeded from rig 1 (9.3 GB tar, ~5 min total), hashing 272 TH/s on 70B = same as rig 1.
+  Model comparison on rig 2: Llama-3.1-8B-pearl = 208 TH/s (2300 GEMMs/10 s, 44.7k prompt tok/s)
+  vs 70B = 272 TH/s. Bigger GEMMs win; keep 70B. Next lever tested: MAX_NUM_BATCHED_TOKENS 32768.
+- Vast SSH gotcha: keys attached via API after creation may never land in the container (rig 2's
+  first instance). Reliable fix: on-start script that appends the pubkey to /root/.ssh/authorized_keys
+  (`vastai create instance <offer> --template_hash ... --onstart-cmd ...`). `vastai destroy instance`
+  prompts and aborts non-interactively; use the API DELETE instead.
+- Batch cap test on rig 2: MAX_NUM_BATCHED_TOKENS 32768 + LOADGEN_CONCURRENCY 24 -> 274-282 TH/s (avg m ~22k),
+  ~+2 % over 16k. Adopted as default on both rigs and in env.example.
