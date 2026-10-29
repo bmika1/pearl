@@ -185,3 +185,10 @@ only clears at ≲ $0.40/h for a 5090-class card.
   endpoint found. Network hashrate for the pool-mode estimate = Blockbook difficulty x 1.44e12
   (empirical ratio from our node's getmininginfo), matches trackers (7.13e19).
 - status.py pool mode parses WildRig's ANSI-coloured output (logstream strips ANSI now).
+
+## 2026-10-29 21:15 UTC — rigs stopped (not destroyed)
+- Ran `stop.sh` + killed leftover wildrig/status loops on both rigs, then `vastai stop instance 58269632` (Colorado) and `58284662` (Japan). `cur_state=stopped`, `intended_status=stopped`; `actual_status` lags a minute.
+- Stopped instances still bill storage: 300 GB × $0.20/GB/month ≈ $2.00/day each ($4/day for both). GPU rent ($3.68 + $4.08/h) stops.
+- Restart: `vastai start instance <id>` then `bash /workspace/ops/run-pool.sh` on each. Restart can fail if the host has rented the GPU to someone else meanwhile; then destroy + recreate (pool mode needs no model pull, ~15 min).
+- At shutdown: 102 and 117 accepted shares on Pearlhash, treasury still 0 PRL (no payout reached the 1 PRL minimum). Pool `/api/stats` was returning empty from the Mac, so pending balance could not be read; it is credited to the address and pays out once ≥1 PRL.
+- Site: both rig tabs will show stale status ("last seen" grows); nothing to change.
