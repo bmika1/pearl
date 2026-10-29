@@ -91,6 +91,16 @@ bash /workspace/ops/stop.sh                                      # stop everythi
 `stop.sh`, then destroy the instance in Vast. Nothing on the box can spend funds: it only ever had
 the public address. Rotate nothing. If you re-rent, the bootstrap is idempotent.
 
+## Pool mode (steady payouts instead of a solo lottery)
+
+`MODE=pool` in `env` and `run-pool.sh` instead of `run.sh`. The rig runs WildRig Multi 0.51.8
+against the Pearlhash pool (`pool.pearlhash.xyz:9000`, 1 % pool fee, 0 % dev fee there, 1 PRL
+minimum payout) with the same log shipper, status collector and watchdog. No node, no model:
+bootstrap is not needed beyond the base image. Measured on H200 NVL: ~680-705 TH/s (vs ~275 TH/s
+on the vLLM path), about 9.5 PRL/day per rig at a 71 EH/s network. The status snapshot carries
+`mode: pool`, `pool.{hashrate_ths, accepted, rejected, est_prl_day}` and `treasury.balance_prl`
+read from Blockbook; the site renders pool cards for it. `stop.sh` stops either mode.
+
 ## Adding a rig without the hour of chain sync
 
 After `bootstrap.sh` on the new rig and before its `run.sh`, seed its chain from a rig that is

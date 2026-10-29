@@ -6,7 +6,7 @@ ENV_FILE="${ENV_FILE:-$HERE/env}"
 # shellcheck disable=SC1090
 set -a; . "$ENV_FILE"; set +a
 RUN="${WORKSPACE:-/workspace}/run"
-for n in watchdog loadgen vllm gateway pearld status tunnel logstream; do
+for n in watchdog miner loadgen vllm gateway pearld status tunnel logstream; do
   if [ -f "$RUN/$n.pid" ]; then
     pid="$(cat "$RUN/$n.pid")"
     if kill -0 "$pid" 2>/dev/null; then

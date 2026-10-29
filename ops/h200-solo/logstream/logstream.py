@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from redact import redact, should_drop  # noqa: E402
 
 TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})")
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 LEVEL_RE = re.compile(r"\b(ERROR|CRITICAL|WARN(?:ING)?|INFO|DEBUG)\b")
 
 
@@ -39,8 +40,8 @@ class Buffer:
         self.lock = threading.Lock()
 
     def add(self, src, text):
-        text = text.rstrip("\r\n")
-        if not text or should_drop(text):
+        text = ANSI_RE.sub("", text).rstrip("\r\n")
+        if not text.strip() or should_drop(text):
             return
         text = redact(text)[:2000]
         m = TS_RE.match(text)
@@ -49,8 +50,10 @@ class Buffer:
         if lvl:
             kind = {"ERROR": "error", "CRITICAL": "error", "WARN": "warn", "WARNING": "warn",
                     "DEBUG": "debug"}.get(lvl.group(1), "info")
-        if "Block found!" in text or "Block accepted by node!" in text or "verified ZK proof" in text:
+        if "Block found!" in text or "Block accepted by node!" in text or "verified ZK proof" in text or "block found" in text.lower():
             kind = "block"
+        elif text.lstrip().startswith("[") and "] accepted (" in text:
+            kind = "info"
         with self.lock:
             self.seq += 1
             self.lines.append({"seq": self.seq, "t": int(time.time()), "ts": m.group(1) if m else None,

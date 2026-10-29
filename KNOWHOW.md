@@ -171,3 +171,17 @@ only clears at ≲ $0.40/h for a 5090-class card.
   prompts and aborts non-interactively; use the API DELETE instead.
 - Batch cap test on rig 2: MAX_NUM_BATCHED_TOKENS 32768 + LOADGEN_CONCURRENCY 24 -> 274-282 TH/s (avg m ~22k),
   ~+2 % over 16k. Adopted as default on both rigs and in env.example.
+
+## Pool mode switch (2026-10-29 19:30 UTC)
+
+- Both rigs now run `ops/h200-solo/run-pool.sh`: WildRig Multi 0.51.8, `--algo pearlhash`, Pearlhash
+  pool, worker = rig id, payouts to the treasury address. Rig 1 ~681 TH/s, rig 2 ~703 TH/s, shares
+  accepted within a minute, est ~9.3-9.6 PRL/day each (1 % fee). Solo stack stopped (logs kept as
+  `*.solo.old`); switch back with `MODE=solo` + `run.sh` (chain data still on disk).
+- Oyster Pool is NOT usable: its installer downloads from github.com/oysterpoolcom/pool which 404s.
+  pearlhash/pearlhash-miner is "legacy" with no assets. SRBMiner/BzMiner never name sm90.
+  WildRig's notes name H20/H100/H200/H800 explicitly and it ran first try on sm90.
+- Pearlhash pool API: only `https://pearlhash.xyz/api/stats` (pool hashrate ~15.6 EH/s); no per-miner
+  endpoint found. Network hashrate for the pool-mode estimate = Blockbook difficulty x 1.44e12
+  (empirical ratio from our node's getmininginfo), matches trackers (7.13e19).
+- status.py pool mode parses WildRig's ANSI-coloured output (logstream strips ANSI now).

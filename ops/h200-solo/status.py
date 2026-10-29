@@ -83,6 +83,86 @@ def tail_lines(path, n=4000):
     except FileNotFoundError:
         return []
 
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_HTTP_CACHE = {}
+
+
+def http_json(url, ttl=60):
+    """GET JSON with a small in-process cache (status.py runs once per tick, so cache on disk)."""
+    import hashlib
+    key = os.path.join("/tmp", "status-cache-" + hashlib.sha1(url.encode()).hexdigest()[:12] + ".json")
+    try:
+        if time.time() - os.path.getmtime(key) < ttl:
+            with open(key) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "pearl-status/1"}), timeout=8) as r:
+            data = json.load(r)
+        with open(key, "w") as f:
+            json.dump(data, f)
+        return data
+    except Exception:
+        return None
+
+
+def block_reward(height):
+    S, E = 2.1e9, 650226
+    return S * E / ((height + E) * (height - 1 + E)) if height else 0
+
+
+def collect_pool(env, s, logs):
+    """WildRig on a pool: hashrate/shares from miner.log, treasury + network from Blockbook."""
+    s["mode"] = "pool"
+    lines = [ANSI.sub("", l) for l in tail_lines(os.path.join(logs, "miner.log"), 600)]
+    pool = {"name": "Pearlhash", "url": env.get("POOL_URL", "stratum+tcp://pool.pearlhash.xyz:9000"),
+            "worker": env.get("POOL_WORKER") or (re.search(r"/api/miners/([^/]+)/", env.get("LOGS_PUSH_URL", "")) or [None, None])[1],
+            "fee_pct": 1, "hashrate_ths": None, "accepted": 0, "rejected": 0, "connected": False,
+            "last_share_ago_s": None, "network_hashps": None, "est_prl_day": None}
+    for line in reversed(lines):
+        m = re.search(r"^\s*10s:\s+([\d.]+)\s+TH/s", line) or re.search(r"#\d+\s+\S.*?\s([\d.]+)\s+TH/s", line)
+        if m:
+            pool["hashrate_ths"] = float(m.group(1))
+            break
+    for line in reversed(lines):
+        m = re.search(r"\[(\d{2}:\d{2}:\d{2})\]\s+accepted\s+\((\d+)/(\d+)\)", line)
+        if m:
+            pool["accepted"], pool["rejected"] = int(m.group(2)), int(m.group(3))
+            hh, mm, ss = map(int, m.group(1).split(":"))
+            now = time.gmtime()
+            ago = (now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec) - (hh * 3600 + mm * 60 + ss)
+            pool["last_share_ago_s"] = ago if ago >= 0 else ago + 86400
+            break
+    pool["connected"] = any("use pool" in l or "new job from" in l for l in lines[-200:]) and not any(
+        "disconnected" in l.lower() or "connection refused" in l.lower() for l in lines[-20:])
+    bb = http_json("https://blockbook.pearlresearch.ai/api/", ttl=60) or {}
+    backend = bb.get("backend", {})
+    height = backend.get("blocks")
+    diff = float(backend.get("difficulty") or 0)
+    s["node"] = {"height": None, "network_height": height, "peers": None, "synced": None, "difficulty": diff or None,
+                 "network_hashps": None, "error": None}
+    if diff:
+        # Pearl's getmininginfo networkhashps was ~1.44e12 x difficulty on our synced node (empirical).
+        pool["network_hashps"] = diff * 1.44e12
+        s["node"]["network_hashps"] = pool["network_hashps"]
+    if pool["hashrate_ths"] and pool["network_hashps"] and height:
+        share = pool["hashrate_ths"] * 1e12 / pool["network_hashps"]
+        pool["est_prl_day"] = round(share * (86400 / 194) * block_reward(height) * (1 - pool["fee_pct"] / 100), 2)
+        s["expected_blocks_per_day"] = round(share * 86400 / 194, 5)
+    addr = env.get("PEARLD_MINING_ADDRESS", "")
+    t = http_json(f"https://blockbook.pearlresearch.ai/api/v2/address/{addr}?details=basic", ttl=60) or {}
+    grains = lambda v: int(v or 0) / 1e8
+    s["treasury"] = {"balance_prl": grains(t.get("balance")), "pending_prl": grains(t.get("unconfirmedBalance")),
+                     "received_prl": grains(t.get("totalReceived")), "txs": t.get("txs")} if t else {}
+    s["pool"] = pool
+    s["miner"] = {"work_rate_ths": None, "blocks_found": 0, "blocks_accepted": 0, "last_block_found": None}
+    s["vllm"] = {"ready": False}
+    s["loadgen"] = {}
+    s["procs"] = {n: pid_alive(os.path.join(env.get("WORKSPACE", "/workspace"), "run"), n)
+                  for n in ["miner", "logstream", "status", "watchdog", "tunnel"]}
+    return s
+
 
 def collect(env):
     ws = env.get("WORKSPACE", "/workspace")
@@ -90,6 +170,23 @@ def collect(env):
     now = time.time()
     s = {"ts": int(now), "address": mask_address(env.get("PEARLD_MINING_ADDRESS", "")),
          "model": env.get("MODEL", ""), "version": env.get("PEARL_VERSION", "")}
+
+    s["mode"] = env.get("MODE", "solo")
+    # gpu first (both modes)
+    q0 = sh(["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu",
+             "--format=csv,noheader,nounits"])
+    if q0:
+        parts = [x.strip() for x in q0.splitlines()[0].split(",")]
+        if len(parts) >= 6:
+            s["gpu"] = {"name": parts[0], "util_pct": float(parts[1]), "mem_used_mb": float(parts[2]),
+                        "mem_total_mb": float(parts[3]), "power_w": float(parts[4]), "temp_c": float(parts[5])}
+    if s["mode"] == "pool":
+        collect_pool(env, s, logs)
+        try:
+            s["uptime_s"] = int(now - os.path.getmtime(os.path.join(run, "miner.pid")))
+        except Exception:
+            s["uptime_s"] = None
+        return s
 
     # processes
     s["procs"] = {n: pid_alive(run, n) for n in
@@ -195,6 +292,12 @@ def collect(env):
 
 
 def one_line(s):
+    if s.get("mode") == "pool":
+        p, g, t = s.get("pool", {}), s.get("gpu", {}), s.get("treasury", {})
+        return ("status: pool {name} worker={w} | {h} TH/s | shares {a} ok / {r} rej | gpu {u}% {pw}W | "
+                "treasury {b} PRL (+{pend} pending) | est {e} PRL/day").format(
+            name=p.get("name"), w=p.get("worker"), h=p.get("hashrate_ths"), a=p.get("accepted"), r=p.get("rejected"),
+            u=g.get("util_pct"), pw=g.get("power_w"), b=t.get("balance_prl"), pend=t.get("pending_prl"), e=p.get("est_prl_day"))
     n, g, m, v = s["node"], s["gpu"], s["miner"], s["vllm"]
     return ("status: height {h}/{nh} peers={p} synced={sy} | gpu {u}% {pw}W | work {w} TH/s | "
             "vllm ready={vr} prompt {pt} tok/s | blocks found={bf} accepted={ba}").format(
