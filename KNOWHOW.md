@@ -192,3 +192,4 @@ only clears at ≲ $0.40/h for a 5090-class card.
 - Restart: `vastai start instance <id>` then `bash /workspace/ops/run-pool.sh` on each. Restart can fail if the host has rented the GPU to someone else meanwhile; then destroy + recreate (pool mode needs no model pull, ~15 min).
 - At shutdown: 102 and 117 accepted shares on Pearlhash, treasury still 0 PRL (no payout reached the 1 PRL minimum). Pool `/api/stats` was returning empty from the Mac, so pending balance could not be read; it is credited to the address and pays out once ≥1 PRL.
 - Site: both rig tabs will show stale status ("last seen" grows); nothing to change.
+- 21:20 UTC: both instances destroyed via API DELETE (`{"success": true}` each); `vastai show instances` is empty. No Vast billing remains. Ops kit, env files and site registrations are untouched; new rigs need `bootstrap.sh` (pool mode: skip model pull) and a fresh push token only if the rig id changes.
