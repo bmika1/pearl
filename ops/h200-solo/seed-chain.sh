@@ -29,10 +29,11 @@ SRC_HOST=$(ssh -G "$SRC" | awk '/^hostname /{print $2}'); SRC_PORT=$(ssh -G "$SR
 echo "== pack chain on source ($SRC): pearld stops for the duration of the tar"
 ssh "$SRC" "set -e; cd $WS; set -a; . ops/env; set +a; . ops/lib.sh
   H=\$(prlctl --notls -s 127.0.0.1:44107 -u \"\$PEARLD_RPC_USER\" -P \"\$PEARLD_RPC_PASSWORD\" getblockcount 2>/dev/null || echo '?'); echo \"source height: \$H\"
+  restart_pearld() { nohup \$(pearld_cmd) >> logs/pearld.log 2>&1 & echo \$! > run/pearld.pid; echo 'pearld restarted'; }
+  trap restart_pearld EXIT   # whatever happens below, pearld comes back
   p=\$(cat run/pearld.pid 2>/dev/null || true)
   if [ -n \"\$p\" ] && kill -0 \$p 2>/dev/null; then kill \$p; for i in \$(seq 1 60); do kill -0 \$p 2>/dev/null || break; sleep 1; done; echo 'pearld stopped'; fi
-  rm -f chain-seed.tar; tar -cf chain-seed.tar -C $WS pearld --exclude=pearld/logs; ls -lh chain-seed.tar | awk '{print \"tarball:\", \$5}'
-  nohup \$(pearld_cmd) >> logs/pearld.log 2>&1 & echo \$! > run/pearld.pid; echo 'pearld restarted'" 2>&1 | q
+  rm -f chain-seed.tar; tar --exclude=pearld/logs -cf chain-seed.tar -C $WS pearld; ls -lh chain-seed.tar | awk '{print \"tarball:\", \$5}'" 2>&1 | q
 
 echo "== pull tarball to target and extract"
 ssh "$DST" "set -e; cd $WS; scp -q -o StrictHostKeyChecking=accept-new -P $SRC_PORT root@$SRC_HOST:$WS/chain-seed.tar . && tar -xf chain-seed.tar && rm chain-seed.tar && du -sh pearld && echo 'chain seeded; run.sh will start pearld on it'" 2>&1 | q
