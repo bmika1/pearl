@@ -129,3 +129,27 @@ only clears at ≲ $0.40/h for a 5090-class card.
   `https://<site>/api/miners/<id>/ingest`; cursor advances only on 2xx; 401/404 logged and retried
   every 60 s. `run.sh` passes the flags when `LOGS_PUSH_URL` and `LOGS_PUSH_TOKEN` are set in `env`.
 - Register rigs on the site with `scripts/miners.js register` (needs the site's MINERS_ADMIN_KEY).
+
+## Rig 1 (first live run, started 2026-10-29)
+
+- Vast.ai instance 58269632 on machine 153553 (Colorado, 1x H200 NVL, 300 GB disk, ~$3.68/h,
+  15-day max). Account is a teammate's; API key stored at `~/.config/vastai/vast_api_key` on
+  this Mac (rotate it after the run). SSH alias `pearl-rig1` in `~/.ssh/config`
+  (74.113.137.180:21626, key id_ed25519; proxy alternative ssh2.vast.ai:19904).
+- Kit lives at `/workspace/ops` on the box; `env` has the mining address
+  prl1pnntjpv02ywdg4h3c8yv7eh7ls6m5jysxlyw3xta80qzgprc2kcvqt68tea (from the local oyster
+  wallet, SPV mode, daemon started with nohup; `prlctl --wallet getnewaddress` works while it runs).
+- Bootstrap log: `/workspace/bootstrap.log`; stack logs `/workspace/logs/*.log`.
+- Gotcha fixed: values with spaces/parentheses in `env` must be quoted (the file is sourced by bash).
+- First-run lessons (2026-10-29): (1) `getblocktemplate` SUCCEEDS on a fresh unsynced pearld
+  (height 0/1, before or just after peers connect), so it is not a sync signal on its own;
+  `run.sh` now waits for >=3 peers and local height >= network tip - 2. The earlier version let
+  the gateway+miner start at height 0, the GPU "found" a minimum-difficulty height-1 block and
+  pearld accepted it onto a local fork; fix was to wipe `/workspace/pearld` and restart.
+  (2) Headers messages carry the ZK certificates (`MsgHeaders` max = header + CertificateMaxSize),
+  so header sync is bandwidth-heavy: ~4 MB/s from one sync peer. Block processing ran ~90
+  blocks/s on 192 cores -> ~25-40 min to sync 135k blocks; no bootstrap.dat needed.
+  (3) `pkill -f "bash /workspace/ops/run.sh"` over ssh kills the ssh shell itself (pattern
+  matches its own command line); anchor it: `pkill -f "^bash /workspace/ops/run.sh"`.
+  (4) The compiled pearl_gemm extension needs torch/lib on LD_LIBRARY_PATH when imported
+  before torch; bootstrap/run.sh export it. Build took ~9 min, model pull ~12 min.

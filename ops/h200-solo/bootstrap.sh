@@ -90,7 +90,9 @@ log "python env + CUDA kernel build (this is the slow step: CUTLASS kernels + pl
 export UV_PROJECT_ENVIRONMENT="$VENV" UV_TORCH_BACKEND=cu130 UV_LINK_MODE=copy UV_PYTHON_INSTALL_DIR="$WORKSPACE/uv-python"
 uv python install 3.12
 MAX_JOBS="$(nproc)" uv sync --package vllm-miner --no-dev
-"$VENV/bin/python" -c "import pearl_gemm, vllm_miner, pearl_gateway, pearl_mining; print('miner packages ok, pearl_mining', pearl_mining.__version__)"
+# The CUDA extension links against torch's libc10/libtorch: make them findable for any process.
+export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$VENV/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
+"$VENV/bin/python" -c "import torch, pearl_gemm, vllm_miner, pearl_gateway, pearl_mining; print('miner packages ok, torch', torch.__version__, 'pearl_mining', pearl_mining.__version__)"
 
 log "model download: $MODEL"
 "$VENV/bin/python" - <<'PY'

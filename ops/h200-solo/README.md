@@ -91,6 +91,19 @@ bash /workspace/ops/stop.sh                                      # stop everythi
 `stop.sh`, then destroy the instance in Vast. Nothing on the box can spend funds: it only ever had
 the public address. Rotate nothing. If you re-rent, the bootstrap is idempotent.
 
+## Adding a rig without the hour of chain sync
+
+After `bootstrap.sh` on the new rig and before its `run.sh`, seed its chain from a rig that is
+already synced (run from your laptop; both are SSH aliases):
+
+```bash
+ops/h200-solo/seed-chain.sh pearl-rig1 pearl-rig2
+```
+
+The source's pearld stops for about a minute while its data directory is tarred, then restarts;
+the target pulls the tarball directly from the source and extracts it. `run.sh` on the target then
+only has to catch up the few blocks mined in between.
+
 ## Streaming to the Pearl Strategy site (multiple rigs)
 
 Instead of (or as well as) the quick tunnel, every rig can push its redacted lines to the

@@ -14,6 +14,7 @@ LOGS="$WORKSPACE/logs"
 RUN="$WORKSPACE/run"
 export HF_HOME="${HF_HOME:-$WORKSPACE/hf}"
 export PATH="/usr/local/bin:$PATH"
+export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$VENV/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
 mkdir -p "$LOGS" "$RUN"
 
 RPC_ARGS=(--notls -s 127.0.0.1:44107 -u "$PEARLD_RPC_USER" -P "$PEARLD_RPC_PASSWORD")
@@ -51,25 +52,34 @@ start status bash -c "while true; do
   sleep 15; done"
 
 # ---- 3. node ---------------------------------------------------------------------------------
-start pearld pearld \
-  --datadir="$WORKSPACE/pearld" --logdir="$WORKSPACE/pearld/logs" \
-  --notls --rpclisten=127.0.0.1:44107 \
-  --rpcuser="$PEARLD_RPC_USER" --rpcpass="$PEARLD_RPC_PASSWORD" \
-  --miningaddr="$PEARLD_MINING_ADDRESS" --debuglevel=info
+# shellcheck disable=SC1091
+. "$HERE/lib.sh"
+# shellcheck disable=SC2046
+start pearld $(pearld_cmd)
 
 log "waiting for pearld RPC"
 until prlctl "${RPC_ARGS[@]}" getblockcount >/dev/null 2>&1; do sleep 2; done
 
-log "waiting for initial block download (getblocktemplate stops erroring once synced)"
+log "waiting for initial block download (peers connected, local height at the network tip, getblocktemplate OK)"
 while true; do
-  out="$(prlctl "${RPC_ARGS[@]}" getblocktemplate 2>&1 || true)"
-  if echo "$out" | grep -qiE 'downloading blocks|not connected|code: -(9|10)'; then
-    h="$(prlctl "${RPC_ARGS[@]}" getblockcount 2>/dev/null || echo '?')"
-    log "syncing... local height $h"
-    sleep 30
-  else
+  read -r peers local tip <<<"$(python3 - "$PEARLD_RPC_USER" "$PEARLD_RPC_PASSWORD" <<'PYEOF'
+import json, subprocess, sys
+u, p = sys.argv[1], sys.argv[2]
+def rpc(m):
+    r = subprocess.run(["prlctl", "--notls", "-s", "127.0.0.1:44107", "-u", u, "-P", p, m], capture_output=True, text=True, timeout=20)
+    return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
+peers = rpc("getpeerinfo") or []
+tip = max([max(x.get("currentheight", 0) or 0, x.get("startingheight", 0) or 0) for x in peers] or [0])
+print(len(peers), rpc("getblockcount") or 0, tip)
+PYEOF
+)"
+  gbt_ok=0
+  prlctl "${RPC_ARGS[@]}" getblocktemplate >/dev/null 2>&1 && gbt_ok=1
+  if [ "${peers:-0}" -ge 3 ] && [ "${tip:-0}" -gt 1000 ] && [ "${local:-0}" -ge $((tip - 2)) ] && [ "$gbt_ok" = 1 ]; then
     break
   fi
+  log "syncing... local height ${local:-?} / network ${tip:-?} (${peers:-0} peers, template ok=$gbt_ok)"
+  sleep 30
 done
 log "node synced at height $(prlctl "${RPC_ARGS[@]}" getblockcount)"
 
