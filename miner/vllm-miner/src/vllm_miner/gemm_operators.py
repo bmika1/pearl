@@ -1,6 +1,9 @@
+import time
+
 import torch
 from miner_base.commitment_hash import CommitmentHasher
 from miner_base.gpu_matmul_config import GPUMatmulConfigFactory
+from miner_base.noisy_gemm import inner_hash_per_matmul
 from miner_utils import get_logger
 from pearl_gemm import (
     commitment_hash_from_merkle_roots,
@@ -23,6 +26,57 @@ from .mining_state import (
 )
 
 _LOGGER = get_logger("vllm.pearl_miner")
+
+
+class _WorkMeter:
+    """Periodic mining-throughput log line, so an operator can see the GPU is actually hashing.
+
+    Counts the inner hashes every noisy GEMM contributes (`inner_hash_per_matmul`, the same unit
+    pools report as "hashes") and logs a rate every `interval` seconds. Launch-time accounting:
+    kernels are asynchronous, so the window rate is an estimate smoothed over the interval.
+    Disable with MINER_WORK_LOG_INTERVAL=0.
+    """
+
+    def __init__(self) -> None:
+        import os
+        import threading
+
+        self._lock = threading.Lock()
+        self._interval = float(os.environ.get("MINER_WORK_LOG_INTERVAL", "10"))
+        self._t0 = time.monotonic()
+        self._hashes = 0
+        self._macs = 0
+        self._gemms = 0
+        self._m_sum = 0
+
+    def record(self, matmul_config, m: int, n: int, k: int) -> None:
+        if self._interval <= 0:
+            return
+        hashes = inner_hash_per_matmul(matmul_config, m, n, k)
+        with self._lock:
+            self._hashes += hashes
+            self._macs += m * n * k
+            self._gemms += 1
+            self._m_sum += m
+            elapsed = time.monotonic() - self._t0
+            if elapsed < self._interval:
+                return
+            rate_h = self._hashes / elapsed
+            rate_mac = self._macs / elapsed
+            gemms, m_avg = self._gemms, self._m_sum / max(1, self._gemms)
+            self._t0 = time.monotonic()
+            self._hashes = self._macs = self._gemms = self._m_sum = 0
+        _LOGGER.info(
+            "miner work rate: {:.2f} TH/s (inner hashes) | {:.1f} T int8-MAC/s | {} noisy GEMMs in {:.1f}s | avg m={:.0f}",
+            rate_h / 1e12,
+            rate_mac / 1e12,
+            gemms,
+            elapsed,
+            m_avg,
+        )
+
+
+_WORK_METER = _WorkMeter()
 
 
 def pearl_gemm_vanilla(
@@ -108,6 +162,7 @@ def pearl_gemm_noisy(
         device=a.device,
     )
     matmul_config = GPUMatmulConfigFactory.create(k=k, noise_rank=r)
+    _WORK_METER.record(matmul_config, m, n, k)
 
     # Get current mining job from shared state
     mining_job = get_async_manager().get_mining_job()

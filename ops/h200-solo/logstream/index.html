@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+  :root { --bg:#0b0d10; --panel:#12161b; --line:#1f262e; --fg:#d7dde3; --dim:#7b8794; --accent:#7dd3a8;
+          --warn:#f0c674; --err:#f08c7a; --block:#ffd166; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var(--mono); }
+  header { padding:14px 16px 10px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:8px 18px; align-items:baseline }
+  header h1 { font-size:16px; margin:0; font-weight:600 }
+  header .meta { color:var(--dim); font-size:12px }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:8px; padding:10px 16px }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px 10px; min-height:58px }
+  .card .k { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.04em }
+  .card .v { font-size:18px; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+  .card .s { color:var(--dim); font-size:11px }
+  .ok { color:var(--accent) } .bad { color:var(--err) } .warn { color:var(--warn) }
+  .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:6px 16px; border-top:1px solid var(--line); border-bottom:1px solid var(--line); font-size:12px }
+  .bar label { color:var(--dim); display:flex; gap:4px; align-items:center }
+  .bar input[type=text] { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:4px; padding:4px 8px; font:inherit; min-width:180px }
+  .src { display:inline-flex; gap:4px; align-items:center; padding:2px 6px; border-radius:4px; border:1px solid var(--line); cursor:pointer; user-select:none }
+  .src.off { opacity:.4 }
+  #log { padding:8px 16px 40px; overflow:auto; height:calc(100vh - 230px); min-height:300px }
+  .ln { display:flex; gap:10px; white-space:pre-wrap; word-break:break-word; padding:1px 0; border-left:3px solid transparent; padding-left:6px }
+  .ln .t { color:var(--dim); flex:0 0 auto; min-width:0 }
+  .ln .s { flex:0 0 auto; width:68px; color:var(--dim); text-align:right }
+  .ln.warn { color:var(--warn) } .ln.error { color:var(--err) } .ln.debug { color:var(--dim) }
+  .ln.block { background:#2a2410; border-left-color:var(--block); color:var(--block); font-weight:600 }
+  .s-pearld{color:#8fb8ff}.s-gateway{color:#c3a6ff}.s-vllm{color:#7dd3a8}.s-loadgen{color:#f0c674}.s-status{color:#9aa5b1}.s-tunnel{color:#ff9fb2}.s-logstream{color:#9aa5b1}
+  footer { position:fixed; bottom:0; left:0; right:0; padding:4px 16px; font-size:11px; color:var(--dim); background:var(--bg); border-top:1px solid var(--line) }
+  @media (max-width:600px){ .ln .s{display:none} #log{height:calc(100vh - 300px)} }
+</style>
+</head>
+<body>
+<header>
+  <h1>__TITLE__</h1>
+  <span class="meta" id="hdr">connecting…</span>
+</header>
+<div class="cards" id="cards"></div>
+<div class="bar">
+  <label>filter <input type="text" id="filter" placeholder="regex, e.g. Block|height"></label>
+  <label><input type="checkbox" id="follow" checked> follow</label>
+  <span id="srcs"></span>
+  <span style="margin-left:auto" id="lag"></span>
+</div>
+<div id="log"></div>
+<footer>Redacted live log. Addresses, credentials and peer IPs are masked on the server before anything is sent. Poll interval 3 s.</footer>
+<script>
+(() => {
+  const logEl = document.getElementById('log'), cards = document.getElementById('cards');
+  const filterEl = document.getElementById('filter'), followEl = document.getElementById('follow');
+  const srcsEl = document.getElementById('srcs'), lagEl = document.getElementById('lag'), hdr = document.getElementById('hdr');
+  let lastSeq = 0, lastServerTime = 0, enabled = {}, knownSrc = new Set(), rows = [], MAX = 3000;
+  try { enabled = JSON.parse(localStorage.getItem('pearl-srcs') || '{}'); } catch (e) {}
+
+  const fmt = (n, d=0) => (n === null || n === undefined) ? '—' : Number(n).toLocaleString(undefined, {maximumFractionDigits:d});
+  const dur = s => { if (s == null) return '—'; const h = Math.floor(s/3600), m = Math.floor(s%3600/60); return h ? `${h}h ${m}m` : `${m}m`; };
+
+  function card(k, v, s, cls='') { return `<div class="card"><div class="k">${k}</div><div class="v ${cls}">${v}</div><div class="s">${s||''}</div></div>`; }
+
+  function renderStatus(st) {
+    if (!st || st.error) { cards.innerHTML = card('status', 'unavailable', st && st.error, 'warn'); return; }
+    const n = st.node || {}, g = st.gpu || {}, m = st.miner || {}, v = st.vllm || {}, p = st.procs || {}, lg = st.loadgen || {};
+    const behind = (n.network_height && n.height) ? n.network_height - n.height : null;
+    const share = (m.work_rate_ths && n.network_hashps) ? (m.work_rate_ths*1e12 / n.network_hashps * 100) : null;
+    cards.innerHTML = [
+      card('node height', fmt(n.height), n.synced ? `synced · ${n.peers ?? '—'} peers` : (behind != null ? `${fmt(behind)} behind · syncing` : (n.error || 'starting')), n.synced ? 'ok' : 'warn'),
+      card('network', fmt(n.network_height), n.network_hashps ? `${fmt(n.network_hashps/1e18, 1)} EH/s · diff ${fmt(n.difficulty/1e6, 2)}M` : ''),
+      card('miner work rate', m.work_rate_ths ? `${fmt(m.work_rate_ths, 1)} TH/s` : '—', share != null ? `${share.toFixed(5)}% of network · ${fmt(st.expected_blocks_per_day, 4)} blk/day` : 'waiting for GEMMs', m.work_rate_ths ? 'ok' : ''),
+      card('blocks', `${fmt(m.blocks_accepted)} accepted`, `${fmt(m.blocks_found)} found${m.last_block_found ? ' · last ' + m.last_block_found : ''}`, m.blocks_accepted ? 'ok' : ''),
+      card('gpu', g.util_pct != null ? `${fmt(g.util_pct)}%` : '—', g.name ? `${g.name} · ${fmt(g.power_w)} W · ${fmt(g.temp_c)}°C · ${fmt(g.mem_used_mb/1024,0)}/${fmt(g.mem_total_mb/1024,0)} GB` : ''),
+      card('vLLM', v.ready ? 'ready' : 'loading', v.prompt_tps != null ? `${fmt(v.prompt_tps)} prompt tok/s` : (st.model || ''), v.ready ? 'ok' : 'warn'),
+      card('load', lg.rps != null ? `${fmt(lg.rps, 2)} req/s` : '—', lg.prompt_tps != null ? `${fmt(lg.prompt_tps)} tok/s · ${fmt(lg.errors)} errors` : ''),
+      card('processes', Object.values(p).filter(Boolean).length + '/' + Object.keys(p).length, Object.entries(p).filter(([k,a])=>!a).map(([k])=>k).join(', ') || 'all up', Object.values(p).every(Boolean) ? 'ok' : 'warn'),
+    ].join('');
+    hdr.textContent = `${st.version || ''} · ${st.model || ''} · reward to ${st.address || '—'} · up ${dur(st.uptime_s)}`;
+  }
+
+  function srcToggle(src) {
+    if (!knownSrc.has(src)) {
+      knownSrc.add(src);
+      if (!(src in enabled)) enabled[src] = true;
+      const el = document.createElement('span');
+      el.className = 'src s-' + src + (enabled[src] ? '' : ' off'); el.textContent = src; el.dataset.src = src;
+      el.onclick = () => { enabled[src] = !enabled[src]; el.classList.toggle('off', !enabled[src]);
+        try { localStorage.setItem('pearl-srcs', JSON.stringify(enabled)); } catch (e) {} rerender(); };
+      srcsEl.appendChild(el);
+    }
+  }
+
+  let re = null;
+  filterEl.oninput = () => { try { re = filterEl.value ? new RegExp(filterEl.value, 'i') : null; filterEl.style.borderColor=''; } catch (e) { filterEl.style.borderColor='var(--err)'; } rerender(); };
+
+  function visible(l) { return enabled[l.src] !== false && (!re || re.test(l.text)); }
+  function lineEl(l) {
+    const d = document.createElement('div');
+    d.className = 'ln ' + l.kind;
+    const t = l.ts ? l.ts.slice(11) : new Date(l.t*1000).toISOString().slice(11,19);
+    d.innerHTML = `<span class="t">${t}</span><span class="s s-${l.src}">${l.src}</span><span>${esc(l.text)}</span>`;
+    return d;
+  }
+  const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  function rerender() {
+    logEl.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    rows.filter(visible).forEach(l => frag.appendChild(lineEl(l)));
+    logEl.appendChild(frag);
+    if (followEl.checked) logEl.scrollTop = logEl.scrollHeight;
+  }
+  function append(lines) {
+    const frag = document.createDocumentFragment();
+    for (const l of lines) { srcToggle(l.src); rows.push(l); if (visible(l)) frag.appendChild(lineEl(l)); }
+    if (rows.length > MAX) { rows = rows.slice(-MAX); rerender(); return; }
+    logEl.appendChild(frag);
+    if (followEl.checked) logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  async function poll() {
+    try {
+      const r = await fetch(`api/lines?after=${lastSeq}`, {cache:'no-store'});
+      const j = await r.json();
+      if (j.last_seq < lastSeq) { lastSeq = 0; rows = []; logEl.innerHTML = ''; }  // server restarted
+      if (j.lines.length) { append(j.lines); lastSeq = j.lines[j.lines.length-1].seq; }
+      lastServerTime = j.server_time;
+      lagEl.textContent = `live · updated ${new Date().toLocaleTimeString()}`; lagEl.className = 'ok';
+    } catch (e) { lagEl.textContent = 'disconnected, retrying…'; lagEl.className = 'bad'; }
+  }
+  async function pollStatus() {
+    try { const r = await fetch('api/status', {cache:'no-store'}); renderStatus(await r.json()); }
+    catch (e) { renderStatus({error: 'no status yet'}); }
+  }
+  poll(); pollStatus();
+  setInterval(poll, 3000); setInterval(pollStatus, 10000);
+})();
+</script>
+</body>
+</html>
