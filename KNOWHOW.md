@@ -193,3 +193,15 @@ only clears at ≲ $0.40/h for a 5090-class card.
 - At shutdown: 102 and 117 accepted shares on Pearlhash, treasury still 0 PRL (no payout reached the 1 PRL minimum). Pool `/api/stats` was returning empty from the Mac, so pending balance could not be read; it is credited to the address and pays out once ≥1 PRL.
 - Site: both rig tabs will show stale status ("last seen" grows); nothing to change.
 - 21:20 UTC: both instances destroyed via API DELETE (`{"success": true}` each); `vastai show instances` is empty. No Vast billing remains. Ops kit, env files and site registrations are untouched; new rigs need `bootstrap.sh` (pool mode: skip model pull) and a fresh push token only if the rig id changes.
+
+## 2026-10-30 13:30 UTC — rig 1 re-created in France (pool only)
+- Offer 57954849 → instance 58407406, machine 152607, H200 NVL, France, $4.00/h, 100 GB disk
+  (~$0.67/day storage if stopped), reliability 0.97, 6.9 Gbps. Cheapest H200 that morning was
+  Washington at $3.98/h with reliability 0.80 — skipped. ssh: `pearl-rig1` alias = ssh2.vast.ai:31932.
+- Pool-only bring-up takes ~3 min: no bootstrap.sh. `apt-get install python3 curl tar procps`,
+  scp ops kit + `env` (MODE=pool, PUBLISH_TUNNEL=0, POOL_WORKER=rig-1), `nohup bash run-pool.sh`.
+  Local copy of the env is `ops/h200-solo/env.rig3` (gitignored).
+- Site registry: removed old rig-1/rig-2, re-registered `rig-1` as "Rig 1 · H200 France" with a new
+  token. Push URL now uses the custom domain: https://www.pearlstrategy.org/api/miners/rig-1/ingest
+  (pearlstrategy.org 308-redirects to www; the apex would break POSTs, always use www).
+- First lines reached the site within 10 s of start; status shows mode=pool, GPU, network height.
