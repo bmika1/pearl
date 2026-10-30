@@ -205,3 +205,7 @@ only clears at ≲ $0.40/h for a 5090-class card.
   token. Push URL now uses the custom domain: https://www.pearlstrategy.org/api/miners/rig-1/ingest
   (pearlstrategy.org 308-redirects to www; the apex would break POSTs, always use www).
 - First lines reached the site within 10 s of start; status shows mode=pool, GPU, network height.
+- 14:50 UTC: France rig stopped cleanly (87 accepted shares, 0 rejected over ~80 min) and instance
+  58407406 destroyed via API (`{"success": true}`). No Vast instances remain. Site registry still
+  has `rig-1` (token valid, now offline); reuse it for the next rig by putting the same
+  LOGS_PUSH_URL/TOKEN from `ops/h200-solo/env.rig3` into the new box's env.
