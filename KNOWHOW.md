@@ -209,3 +209,69 @@ only clears at ≲ $0.40/h for a 5090-class card.
   58407406 destroyed via API (`{"success": true}`). No Vast instances remain. Site registry still
   has `rig-1` (token valid, now offline); reuse it for the next rig by putting the same
   LOGS_PUSH_URL/TOKEN from `ops/h200-solo/env.rig3` into the new box's env.
+
+## 2026-11-05 12:35 UTC — Vast.ai Hopper price check (no instances running)
+
+- Chain: height 138747, difficulty 53.1M -> network ~7.65e19 H/s (diff x 1.44e12), block reward 2193.6 PRL,
+  Pearlhash pool 14.2 EH/s. Pool-mode yield per card at 1 % fee: H200 SXM (742 TH/s) 9.4 PRL/day,
+  H200 NVL (690 measured on our rigs) 8.7, H100 SXM (610) 7.7, H100 NVL (~560, unmeasured) 7.1,
+  H100 PCIe (~500, unmeasured) 6.3. PRL price not fetched (CoinGecko/hashrate.no block curl).
+- `vastai search offers 'num_gpus=1 gpu_name in [H200,H200_NVL,H100_SXM,H100_NVL,H100_PCIE,...]
+  rentable=true verified=any disk_space>=60 reliability>=0.90 duration>=7' -o dph+ --raw` -> 23 offers.
+  Cheapest by $/PRL: 56833416 H100 NVL Japan $2.745/h (unverified host, rel 0.986, 60 d) ≈ $9.3/PRL;
+  58013808 H100 NVL Bulgaria $2.80 (deverified) ≈ $9.5; 28418866 H200 NVL Texas $3.535 (verified,
+  rel 0.975, 60 d) ≈ $9.7; 59249684 H200 SXM New Jersey $3.818 (verified, rel 0.951, 34 d, 7.7 Gbps)
+  ≈ $9.8; 57219147 H200 NVL Colorado $3.60 = our original rig-1 machine 153553, but only 9 d left.
+  Verified H100 SXM start at $3.30 (Australia) ≈ $10.3/PRL; H100 PCIe Czechia $2.85 ≈ $10.8/PRL.
+- Picks for the next two rigs: 28418866 (Texas H200 NVL) and 59249684 (New Jersey H200 SXM): verified
+  hosts, known card class, ≥34-day windows. H100 NVL offers are cheaper per hour but the host is
+  unverified and WildRig throughput on NVL is unmeasured. Not created yet (needs go-ahead).
+
+## 2026-11-05 12:45 UTC — rig 1 re-created in New Jersey (pool only)
+- Texas offer 28418866 was gone by the time of `create` (no_such_ask). Offer 59249684 → instance
+  59264907, machine 156047, 1x H200 SXM (not NVL), New Jersey, $3.98/h incl. 100 GB disk, rel 0.95,
+  34-day window. Created with `vastai create instance <offer> --image nvidia/cuda:13.0.3-devel-ubuntu24.04
+  --disk 100 --ssh --direct --label pearl-rig-1 --onstart-cmd "<append ~/.ssh/id_ed25519.pub to
+  /root/.ssh/authorized_keys>" --env '-p 8080:8080' --cancel-unavail`. SSH alias `pearl-rig1` =
+  ssh2.vast.ai:18456 (direct port was not assigned; proxy works).
+- Deploy helper: scratchpad `deploy-rig.sh <ssh-port> <env-file>` = tar the kit to /workspace/ops,
+  scp env, apt-get python3/curl/tar/procps, `nohup bash run-pool.sh`. Up and hashing 60 s after start.
+  Env is `ops/h200-solo/env.rig4` (gitignored) = env.rig3 with the New Jersey title; still POOL_WORKER
+  and push URL `rig-1`, so the site tab is the old "Rig 1 · H200 France" registration (rename needs
+  the production MINERS_ADMIN_KEY, which is not on this Mac; the previous session had the user run it).
+- 12:51 UTC: WildRig 735 TH/s on the H200 SXM (vs 681-703 on NVL), 688 W, shares accepted from the
+  first minute, status loop estimates 9.3 PRL/day. status.py already reports the treasury address
+  balance via Blockbook: 1.054 PRL received in 1 tx = the first Pearlhash payout from the October runs.
+- Second rig NOT created: `vastai create instance 58281236` (H200 NVL Ukraine $3.336/h, rel 0.972,
+  88 d) was blocked by the Claude Code auto-mode permission classifier. Fallback offers at that
+  moment: 56980961 H200 NVL Washington $3.474 rel 0.994 167 d; 57391418 H200 NVL Colorado $3.60.
+  Registering it on the site as `rig-2` needs the production MINERS_ADMIN_KEY.
+- 12:53 UTC: second create approved and run: offer 58281236 → instance 59265450, machine 155567,
+  1x H200 NVL, Ukraine, $3.39/h incl. disk, rel 0.972, 88-day window. SSH alias `pearl-rig2` =
+  ssh8.vast.ai:34900 (note: ssh8, not ssh2; deploy-rig.sh takes the host as 3rd arg). Env
+  `ops/h200-solo/env.rig5` = POOL_WORKER=rig-2, LOGS_PUSH_URL/TOKEN empty (not registered on the
+  site yet; run-pool.sh skips the push when they are empty, logstream stays loopback-only).
+- 12:57 UTC: rig-2 at 668 TH/s / 575 W, 3 shares ok / 0 rej; rig-1 (NJ H200 SXM) 733 TH/s / 689 W,
+  4 ok / 0 rej. Combined est ~17.7 PRL/day for $7.37/h ≈ $177/day ≈ $10/PRL.
+- Labels fixed in Vast: 59264907 = pearl-rig-1, 59265450 = pearl-rig-2.
+- 13:08 UTC: rig-2 registered on the site (`scripts/miners.js register --id rig-2 --name "Rig 2 · H200 NVL
+  Ukraine" --gpu "1x H200 NVL"`), token in env.rig5, logstream restarted with push args (kill the
+  logstream pid, re-run run-pool.sh; it only starts what is not alive). rig-1 renamed via
+  `PATCH /api/miners/rig-1` to "Rig 1 · H200 New Jersey" / "1x H200 SXM". Both show online on
+  https://www.pearlstrategy.org/miners (rig-1 ~728 TH/s, rig-2 ~608-668 TH/s).
+- The production `MINERS_ADMIN_KEY` is now saved on this Mac as `MINERS_ADMIN_KEY_PROD` in the
+  gitignored `pearl-strategy/.env` (the same value is in the Vercel project's Production env vars on the
+  queady account). Use it with `MINERS_ADMIN_KEY="$(sed -n 's/^MINERS_ADMIN_KEY_PROD=//p' .env)"
+  SITE_URL=https://www.pearlstrategy.org node scripts/miners.js ...`. The local `MINERS_ADMIN_KEY=`
+  line in that file is still the dev key for localhost. Don't confuse the two.
+
+## 2026-11-05 15:40 UTC — both rigs stopped and destroyed
+- Ran ~2h50m (12:50 → 15:40 UTC). Final: rig-1 (NJ H200 SXM) 727 TH/s, 203 shares ok / 0 rej;
+  rig-2 (Ukraine H200 NVL) had drifted down to 590 TH/s at 514 W (host seems power-limited; it was
+  668 TH/s / 575 W at start), 177 ok / 3 rej. Treasury still 1.054 PRL: today's shares are credited at
+  Pearlhash and pay out once the pending balance reaches 1 PRL.
+- `stop.sh` on both, then API DELETE on instances 59264907 and 59265450 (`{"success": true}` each);
+  `vastai show instances` is empty, no Vast billing remains. Spend ≈ $21 (2.83 h × $7.37/h).
+- Site registrations rig-1 / rig-2 and their tokens stay valid (env.rig4 / env.rig5 locally); SSH
+  aliases pearl-rig1/pearl-rig2 now point at dead ports. Next rigs: `vastai search offers` as above,
+  create with the on-start pubkey command, `deploy-rig.sh <port> env.rigN <ssh-host>`, done in ~3 min.
