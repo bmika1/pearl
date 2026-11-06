@@ -34,6 +34,8 @@ RULES = [
     (re.compile(r"/(?:home|Users)/[^/\s]+"), "/~"),
     # Vast.ai / cloud identifiers occasionally printed by tooling
     (re.compile(r"(?i)\b(instance|machine|host)[_ ]?id\s*[=:]\s*\S+"), r"\1_id=***"),
+    # WildRig embeds a political slogan in share lines on some hosts; keep the console neutral.
+    (re.compile(r"(?i)putin\s+khuylo!?\s*"), ""),
 ]
 
 # Lines matching any of these are dropped entirely (noise or request payloads).

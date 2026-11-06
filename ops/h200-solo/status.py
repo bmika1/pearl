@@ -126,9 +126,15 @@ def collect_pool(env, s, logs):
             pool["hashrate_ths"] = float(m.group(1))
             break
     for line in reversed(lines):
-        m = re.search(r"\[(\d{2}:\d{2}:\d{2})\]\s+accepted\s+\((\d+)/(\d+)\)", line)
+        # WildRig prints either "accepted (A/R)" or, on some builds, "Share accepted (A)"
+        m = re.search(r"\[(\d{2}:\d{2}:\d{2})\].*?\baccepted\s+\((\d+)(?:/(\d+))?\)", line, re.I)
         if m:
-            pool["accepted"], pool["rejected"] = int(m.group(2)), int(m.group(3))
+            pool["accepted"] = int(m.group(2))
+            if m.group(3) is not None:
+                pool["rejected"] = int(m.group(3))
+            else:
+                r = next((re.search(r"Rejected:\s+(\d+)", l) for l in reversed(lines) if re.search(r"Rejected:\s+\d+", l)), None)
+                pool["rejected"] = int(r.group(1)) if r else 0
             hh, mm, ss = map(int, m.group(1).split(":"))
             now = time.gmtime()
             ago = (now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec) - (hh * 3600 + mm * 60 + ss)

@@ -20,6 +20,9 @@ class RedactTests(unittest.TestCase):
         self.assertNotIn(key, out)
         self.assertIn("e3b0c4…b855", out)
 
+    def test_miner_slogan_stripped(self):
+        self.assertEqual(redact("[14:02:58] putin khuylo! Share accepted (1) \tGPU#0"), "[14:02:58] Share accepted (1) \tGPU#0")
+
     def test_address_and_network(self):
         addr = "prl1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"
         out = redact("miningaddr " + addr)

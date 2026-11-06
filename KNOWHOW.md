@@ -275,3 +275,16 @@ only clears at ≲ $0.40/h for a 5090-class card.
 - Site registrations rig-1 / rig-2 and their tokens stay valid (env.rig4 / env.rig5 locally); SSH
   aliases pearl-rig1/pearl-rig2 now point at dead ports. Next rigs: `vastai search offers` as above,
   create with the on-start pubkey command, `deploy-rig.sh <port> env.rigN <ssh-host>`, done in ~3 min.
+
+## 2026-11-06 14:00 UTC — two rigs up (Ukraine + New York), pool mode
+- Offers: 58281236 → instance 59419085 (Ukraine, $3.34/h, rel 0.976, `pearl-rig1` = ssh7.vast.ai:37370)
+  and 48842896 → 59419087 (New York, $3.75/h, rel 0.997, `pearl-rig2` = ssh5.vast.ai:30414). 100 GB disks.
+- Site registry: a stale `rig-2 · H200 NVL Ukraine` existed (registered 2026-11-05 outside this
+  session, last seen that day at ~590 TH/s, no Vast instance behind it) — removed. Now `rig-1`
+  (Ukraine) and `rig-2` (New York) with fresh tokens; envs in `ops/h200-solo/env.ukraine` /
+  `env.newyork` (gitignored). Deploy script: scratchpad `deploy-pool.sh <host> <port> <env>`.
+- Gotchas: zsh does not word-split `$SSH="ssh -p ..."` — put deploy logic in a bash script.
+  Background `until ssh ...` waiters never fired (sandbox/BatchMode); deploy in the foreground.
+- WildRig on the Ukraine host prints shares as `putin khuylo! Share accepted (N)` instead of
+  `accepted (A/R)`. status.py now parses both; redact.py strips the slogan so it does not reach
+  the public console. First treasury payout has landed: 3.954 PRL at 2026-11-06.
