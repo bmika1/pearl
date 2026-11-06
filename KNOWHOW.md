@@ -288,3 +288,8 @@ only clears at ≲ $0.40/h for a 5090-class card.
 - WildRig on the Ukraine host prints shares as `putin khuylo! Share accepted (N)` instead of
   `accepted (A/R)`. status.py now parses both; redact.py strips the slogan so it does not reach
   the public console. First treasury payout has landed: 3.954 PRL at 2026-11-06.
+- 14:58 UTC: rig 3 added — offer 51589351 → instance 59427754 (Spain, $3.60/h, rel 0.998,
+  `pearl-rig3` = ssh6.vast.ai:21588), site id `rig-3`, env `ops/h200-solo/env.spain`. WildRig's
+  "Failed to find OpenCL platform" at start is benign; it falls through to CUDA and mines.
+  Vast credit was $1.04 at 14:10 (minutes from auto-stop at $7.17/h) — user topped up to $25.55;
+  with 3 rigs burn is ~$10.8/h, so credit needs watching (`vastai show user --raw` → credit).
